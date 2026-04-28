@@ -604,7 +604,7 @@ def _start_redraw_timer():
     if _state._redraw_timer is not None:
         return
     _state._redraw_timer = bpy.app.timers.register(
-        _redraw_tick, first_interval=1.0 / 24.0)
+        _redraw_tick, first_interval=1.0 / 60.0)
 
 
 def _stop_redraw_timer():

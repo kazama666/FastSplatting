@@ -11,10 +11,6 @@ High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport usi
 - **Animation Export** — Export 3D viewport frames as PNG image sequences with optional per-frame sorting
 - **GPU Instancing** — All splats batched into per-block GPU batches with precomputed 3D covariance on CPU
 
-## Requirements
-
-- Blender 4.2.0+
-- `numpy` (bundled with Blender)
 
 ## Installation
 
@@ -50,6 +46,7 @@ Or install as a legacy addon by placing the folder in Blender's `scripts/addons/
 | Splat Scale | Uniform scale multiplier for splat size |
 
 ### Animation Export
+Fast Spatting does not support for render pipline, so if you want to export animation, you need to use the animation export function to snapshot the viewport to image sequence.
 
 1. Set **Start/End** frame range
 2. Choose **Output** directory
@@ -78,6 +75,15 @@ Fast Splatting/
 - Splat count and block size determine memory and draw-call overhead. Larger block size = fewer blocks = fewer draw calls but coarser culling
 - The initial sort after loading or large camera moves may take several frames to converge; **Sort Blocks per Frame** controls the tradeoff
 
-## License
+### Getting Splat Data
 
-GPL-3.0-or-later
+Fast Splatting works with Gaussian Splat files generated from external tools.
+
+You can generate splats using:
+
+- Tencent Hunyuan (single-image world generation)
+- Any Gaussian Splatting pipeline that exports .ply
+- Scanned data (Polycam, RealityScan, etc.)
+
+## License
+GPL-3.0

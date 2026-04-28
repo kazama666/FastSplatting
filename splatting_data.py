@@ -31,7 +31,7 @@ class SplattingState:
         self.block_bounds = None   # (M, 2, 3) min/max for each block
         self.block_centers = None  # (M, 3) center of each block
         self.block_radii = None    # (M,) bounding sphere radius for each block
-        self.block_splat_indices = None  # List of lists, splat indices per block
+        self.block_splat_indices = None  # list of np.ndarray, splat indices per block
 
         # LOD data: for each LOD level, store (positions, colors, opacities, scales, rotations) per block
         self.lod_data = [None] * LOD_LEVELS
@@ -43,7 +43,7 @@ class SplattingState:
         # Auto-sort state (alpha blend incremental sorting)
         self.sorted_up_to = 0
         self._sort_active = False
-        self._sort_camera_pos = None
+        self._camera_pos_np = None
         self._prev_view_matrix = None
         self._vp_matrix = None        # current VP matrix from renderer (for visibility)
         self._proj_00 = 0.0
@@ -74,7 +74,7 @@ class SplattingState:
         self.lod_data = [None] * LOD_LEVELS
         self.sorted_up_to = 0
         self._sort_active = False
-        self._sort_camera_pos = None
+        self._camera_pos_np = None
         self._prev_view_matrix = None
         self._vp_matrix = None
         self._proj_00 = 0.0
@@ -264,7 +264,7 @@ def build_spatial_index(positions, block_size=1.0, use_parallel=True):
     sorted_idx = np.argsort(inverse)
     split_pts = np.where(np.diff(inverse[sorted_idx]) != 0)[0] + 1
     block_splat_indices_np = np.split(sorted_idx, split_pts)
-    block_splat_indices = [list(idx) for idx in block_splat_indices_np]
+    block_splat_indices = [idx.astype(np.int32) for idx in block_splat_indices_np]
 
     # Per-block stats: center, radius, bounds
     block_centers = np.zeros((block_count, 3), dtype=np.float32)
@@ -502,13 +502,13 @@ def sort_blocks_far_to_near(camera_pos):
     pos = _state.positions
     cp = np.array([camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
     for i in range(_state.block_count):
-        indices = np.array(_state.block_splat_indices[i])
+        indices = _state.block_splat_indices[i]
         if len(indices) < 2:
             continue
         diff = pos[indices] - cp
         dists = np.sum(diff * diff, axis=1)
         order = np.argsort(dists)[::-1]  # far to near
-        _state.block_splat_indices[i] = indices[order].tolist()
+        _state.block_splat_indices[i] = indices[order]
 
     # Rebuild LOD data — disabled
     # _state.lod_data = build_lod_data(
@@ -549,8 +549,8 @@ def sort_next_batch(context):
         _stop_redraw_timer()
         return
 
-    cp = _state._sort_camera_pos
-    if cp is None:
+    cp_np = _state._camera_pos_np
+    if cp_np is None:
         _state._sort_active = False
         _stop_redraw_timer()
         return
@@ -558,44 +558,41 @@ def sort_next_batch(context):
     _start_redraw_timer()
 
     end = min(_state.sorted_up_to + per_frame, _state.block_count)
-    cp_np = np.array([cp[0], cp[1], cp[2]], dtype=np.float32)
     pos = _state.positions
-    block_range = list(range(_state.sorted_up_to, end))
+    block_range = np.arange(_state.sorted_up_to, end, dtype=np.intp)
 
-    # Prioritise visible blocks so the user sees correct blending sooner
+    # Prioritise visible blocks via vectorised frustum test
     vp = _state._vp_matrix
     if vp is not None:
-        from mathutils import Vector
-        front, back = [], []
-        for i in block_range:
-            bc = _state.block_centers[i]
-            br = _state.block_radii[i]
-            center_clip = vp @ Vector((bc[0], bc[1], bc[2], 1.0))
-            if center_clip[3] <= 0:
-                back.append(i)
-                continue
-            margin_x = br * _state._proj_00
-            margin_y = br * _state._proj_11
-            if (abs(center_clip[0]) < center_clip[3] + margin_x and
-                    abs(center_clip[1]) < center_clip[3] + margin_y):
-                front.append(i)
-            else:
-                back.append(i)
-        block_range = front + back
+        centers = _state.block_centers[block_range]
+        radii = _state.block_radii[block_range]
+        ones = np.ones((len(block_range), 1), dtype=np.float32)
+        centers_h = np.concatenate([centers, ones], axis=1)
+        vp_np = np.asarray(vp, dtype=np.float32)
+        clip = centers_h @ vp_np.T  # (N, 4)
+
+        behind = clip[:, 3] <= 0
+        margin_x = radii * _state._proj_00
+        margin_y = radii * _state._proj_11
+        in_frustum = ~behind & (
+            (np.abs(clip[:, 0]) < clip[:, 3] + margin_x) &
+            (np.abs(clip[:, 1]) < clip[:, 3] + margin_y)
+        )
+        block_range = np.concatenate([block_range[in_frustum], block_range[~in_frustum]])
 
     for i in block_range:
-        indices = np.array(_state.block_splat_indices[i])
+        indices = _state.block_splat_indices[i]
         if len(indices) < 2:
             continue
         diff = pos[indices] - cp_np
         dists = np.sum(diff * diff, axis=1)
         order = np.argsort(dists)[::-1]
-        _state.block_splat_indices[i] = indices[order].tolist()
+        _state.block_splat_indices[i] = indices[order]
 
-    _state.sorted_up_to = end
+    _state.sorted_up_to = int(end)
 
     from .gpu_renderer import get_renderer
-    get_renderer().clear_block_cache(block_range)
+    get_renderer().clear_block_cache(block_range.tolist())
 
     if _state.sorted_up_to >= _state.block_count:
         _state._sort_active = False

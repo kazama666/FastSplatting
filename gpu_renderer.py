@@ -278,7 +278,7 @@ void main() {
         lod_factor = 4 ** lod_level
         count = max(1, len(block_splat_indices) // lod_factor)
         lod_indices = block_splat_indices[:count]
-        if not lod_indices:
+        if len(lod_indices) == 0:
             return None
 
         batch = self._build_billboard_batch(
@@ -302,7 +302,7 @@ void main() {
             indices = state_obj.block_splat_indices[block_idx]
             count = max(1, len(indices) // 16)
             lod_indices.extend(indices[:count])
-        if not lod_indices:
+        if len(lod_indices) == 0:
             return None
 
         batch = self._build_billboard_batch(
@@ -450,6 +450,8 @@ void main() {
             view_matrix = view_matrix @ model_matrix
 
         camera_pos = view_matrix.inverted().translation
+        state_obj._camera_pos_np = np.array(
+            [camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
 
         # Store VP matrix + projection params for sort visibility check
         state_obj._vp_matrix = vp_matrix
@@ -462,8 +464,6 @@ void main() {
             state_obj._sort_active = True
             if state_obj.sorted_up_to >= state_obj.block_count:
                 state_obj.sorted_up_to = 0
-            if camera_pos is not None:
-                state_obj._sort_camera_pos = camera_pos
         sort_next_batch(context)
 
         splatting_props = context.scene.splatting_properties
@@ -474,7 +474,7 @@ void main() {
         # Vectorized block distance computation
         block_centers = state_obj.block_centers
         block_radii = state_obj.block_radii
-        cam_pos_np = np.array([camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
+        cam_pos_np = state_obj._camera_pos_np
         distances = np.linalg.norm(block_centers - cam_pos_np, axis=1)
         sorted_order = np.argsort(distances)
         if not near_to_far:

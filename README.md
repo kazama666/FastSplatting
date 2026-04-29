@@ -1,4 +1,6 @@
 
+**English** | [中文](README_zh.md)
+
 ![banner](assets/banner.png)
 High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport using GPU instanced rendering with custom GLSL shaders.
 

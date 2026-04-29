@@ -35,7 +35,7 @@ You can generate splats using:
 ### Quick Start
 
 1. **Import a PLY model** — `File → Import → PLY (.ply)`, select a Gaussian Splatting PLY file
-2. **Select the imported mesh** — Select the mesh in the 3D viewport, then in the sidebar (`N` key → **FastSplatting** tab) click the object icon button to set it as target
+2. **Add the imported mesh** — Select the mesh in the 3D viewport, then in the sidebar (`N` key → **FastSplatting** tab) click **+** button to add it to the **Splat Meshes** list
 3. **Start Render** — Click **Start Render** to initialize GPU buffers and begin rendering
 4. **Stop Render** — Click **Stop Render** to release GPU resources
 

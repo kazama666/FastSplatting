@@ -1,6 +1,29 @@
 import bpy
 from bpy import types
 
+
+# ---------------------------------------------------------------------------
+# UIList for splat instances (draggable, Bone-Collection style)
+# ---------------------------------------------------------------------------
+class SPLATTING_UL_instances(types.UIList):
+    use_drag_reorder = True
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            return
+        row = layout.row(align=True)
+        op = row.operator("splatting.toggle_instance", text="", icon='HIDE_OFF' if item.enabled else 'HIDE_ON', emboss=False)
+        op.index = index
+        obj = bpy.data.objects.get(item.mesh_name)
+        if obj and obj.type == 'MESH':
+            row.label(text=obj.name)
+        else:
+            row.label(text=item.mesh_name or "(missing)", icon='ERROR')
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
 class SPLATTING_PT_panel(types.Panel):
     bl_label = "Fast Splatting"
     bl_idname = "SPLATTING_PT_panel"
@@ -12,20 +35,34 @@ class SPLATTING_PT_panel(types.Panel):
         layout = self.layout
         scene = context.scene
         splatting_props = scene.splatting_properties
-        
 
+        # --- Splat instances (collapsible) ---
+        meshes_header, meshes_body = layout.panel_prop(splatting_props, "ui_meshes_expanded")
+        meshes_header.label(text="Splat Meshes", icon='OBJECT_DATA')
+        if meshes_body:
+            row = meshes_body.row()
+            row.template_list(
+                "SPLATTING_UL_instances", "",
+                scene, "splatting_instances",
+                splatting_props, "active_instance_index",
+                rows=4,
+            )
+            col = row.column(align=True)
+            if not splatting_props.is_rendering:
+                col.operator("splatting.add_instance", text="", icon='ADD')
+                col.operator("splatting.remove_instance", text="", icon='REMOVE')
+                col.separator()
+            col.operator("splatting.move_instance", text="", icon='TRIA_UP').direction = 'UP'
+            col.operator("splatting.move_instance", text="", icon='TRIA_DOWN').direction = 'DOWN'
+
+        # --- Settings (collapsible, only when not rendering) ---
         if not splatting_props.is_rendering:
-            # Mesh selection
-            box = layout.box()
-            box.label(text="Initialization Settings", icon='SETTINGS')
-            row = box.row()
-            row.label(text="Splatting Mesh:")
-            row.prop(scene, "splatting_target_mesh", text="")
-            row.operator("splatting.select_mesh", text="", icon='OBJECT_DATA')
-            box.prop(splatting_props, "block_size", text="Block Size")
-            layout.split()
+            settings_header, settings_body = layout.panel_prop(splatting_props, "ui_settings_expanded")
+            settings_header.label(text="Settings", icon='SETTINGS')
+            if settings_body:
+                settings_body.prop(splatting_props, "block_size", text="Block Size")
 
-        # Render controls
+        # --- Render controls ---
         if not splatting_props.is_rendering:
             layout.operator("splatting.start_render", text="Start Render", icon='PLAY')
         else:
@@ -33,30 +70,29 @@ class SPLATTING_PT_panel(types.Panel):
 
         layout.separator()
 
-        '''
-        # LOD toggle
-        row = layout.row()
-        row.prop(splatting_props, "lod_enabled", text="Enable LOD")
-        if splatting_props.lod_enabled:
-            row = layout.row()
-            row.prop(splatting_props, "lod_bias", text="LOD Bias", slider=True)
-
-        layout.separator()
-        '''
-
-        layout.split()
-
         # Color adjustments
         color_header, color_body = layout.panel_prop(splatting_props, "ui_color_expanded")
         color_header.label(text="Render Adjust", icon='COLOR')
         if color_body:
-            color_body.prop(splatting_props, "color_tint", text="Tint")
-            color_body.prop(splatting_props, "color_brightness", text="Exposure", slider=True)
-            color_body.prop(splatting_props, "color_gamma", text="Gamma", slider=True)
-            color_body.prop(splatting_props, "color_hue", text="Hue", slider=True)
-            color_body.prop(splatting_props, "color_saturation", text="Saturation", slider=True)
-            color_body.split()
-            color_body.prop(splatting_props, "quad_scale", text="Splat Scale", slider=True)
+            instances = scene.splatting_instances
+            idx = splatting_props.active_instance_index
+            if 0 <= idx < len(instances):
+                item = instances[idx]
+                name = item.mesh_name
+                obj = bpy.data.objects.get(name)
+                if obj and obj.type == 'MESH':
+                    color_body.label(text=obj.name, icon='OBJECT_DATA')
+                else:
+                    color_body.label(text=name or "(missing)", icon='ERROR')
+                color_body.prop(item, "color_tint", text="Tint")
+                color_body.prop(item, "color_brightness", text="Exposure", slider=True)
+                color_body.prop(item, "color_gamma", text="Gamma", slider=True)
+                color_body.prop(item, "color_hue", text="Hue", slider=True)
+                color_body.prop(item, "color_saturation", text="Saturation", slider=True)
+                color_body.split()
+                color_body.prop(item, "quad_scale", text="Splat Scale", slider=True)
+            else:
+                color_body.label(text="Select a mesh from Splat Meshes list", icon='INFO')
 
         layout.split()
 
@@ -73,40 +109,32 @@ class SPLATTING_PT_panel(types.Panel):
 
         layout.split()
 
-        # Infomations
+        # Statistics
         if splatting_props.is_rendering:
             from .splatting_data import get_state
-            state = get_state()
+            scene_state = get_state()
             stats_header, stats_body = layout.panel_prop(splatting_props, "ui_stats_expanded")
             stats_header.label(text="Statistics", icon='INFO')
             if stats_body:
-                stats_body.label(text=f"Totle: {splatting_props.block_count:,} blocks, {splatting_props.point_count:,} splats")
-                stats_body.label(text=f"Displayed: {state.displayed_block_count:,} blocks, {state.displayed_splat_count:,} splats")
-
-
-class SPLATTING_OT_render_status(bpy.types.Operator):
-    """Dummy operator for status updates"""
-    bl_idname = "splatting.update_status"
-    bl_label = "Update Status"
-
-    def execute(self, context):
-        return {'FINISHED'}
+                # Only count enabled instances
+                enabled_names = {item.mesh_name for item in scene.splatting_instances if item.enabled}
+                total_points = sum(
+                    inst.point_count for inst in scene_state.instances
+                    if inst.target_mesh and inst.target_mesh.name in enabled_names)
+                total_blocks = sum(
+                    inst.block_count for inst in scene_state.instances
+                    if inst.target_mesh and inst.target_mesh.name in enabled_names)
+                stats_body.label(
+                    text=f"Total: {total_blocks:,} blocks, {total_points:,} splats")
+                stats_body.label(
+                    text=f"Displayed: {scene_state.displayed_block_count:,} blocks, {scene_state.displayed_splat_count:,} splats")
 
 
 def register():
-    # Register target mesh property
-    bpy.types.Scene.splatting_target_mesh = bpy.props.StringProperty(
-        name="Target Mesh",
-        description="Mesh object containing splatting PLY data",
-        default="",
-    )
-
-    bpy.utils.register_class(SPLATTING_OT_render_status)
+    bpy.utils.register_class(SPLATTING_UL_instances)
     bpy.utils.register_class(SPLATTING_PT_panel)
 
 
 def unregister():
     bpy.utils.unregister_class(SPLATTING_PT_panel)
-    bpy.utils.unregister_class(SPLATTING_OT_render_status)
-
-    del bpy.types.Scene.splatting_target_mesh
+    bpy.utils.unregister_class(SPLATTING_UL_instances)

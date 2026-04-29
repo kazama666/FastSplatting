@@ -10,18 +10,15 @@ from bpy import types
 _capture_handler = None
 _capture_requested = False
 _capture_ready = False
-_capture_vp_w = 0          # physical pixel dimensions from viewport_get
+_capture_vp_w = 0
 _capture_vp_h = 0
 
 
 def _post_view_capture():
-    """Called inside Blender's draw cycle after splats are drawn."""
     global _capture_requested, _capture_ready
     global _capture_vp_w, _capture_vp_h
-
     if not _capture_requested:
         return
-
     import gpu
     _, _, w, h = gpu.state.viewport_get()
     _capture_vp_w = w
@@ -69,18 +66,107 @@ class SPLATTING_OT_stop_render(types.Operator):
         return {'FINISHED'}
 
 
-class SPLATTING_OT_select_mesh(types.Operator):
-    bl_idname = "splatting.select_mesh"
-    bl_label = "Select Mesh"
-    bl_description = "Select mesh object containing Gaussian Splatting PLY data"
+class SPLATTING_OT_add_instance(types.Operator):
+    bl_idname = "splatting.add_instance"
+    bl_label = "Add Splat Instance"
+    bl_description = "Add the selected mesh object as a splat instance"
 
     def execute(self, context):
         obj = context.active_object
-        if obj and obj.type == 'MESH':
-            context.scene.splatting_target_mesh = obj.name
-            self.report({'INFO'}, f"Selected: {obj.name}")
-        else:
+        if not obj or obj.type != 'MESH':
             self.report({'WARNING'}, "Please select a mesh object first")
+            return {'CANCELLED'}
+
+        # Check for duplicates
+        for item in context.scene.splatting_instances:
+            if item.mesh_name == obj.name:
+                self.report({'INFO'}, f"'{obj.name}' is already in the list")
+                return {'CANCELLED'}
+
+        item = context.scene.splatting_instances.add()
+        item.mesh_name = obj.name
+        item.mesh_uid = obj.session_uid
+        item.enabled = True
+        context.scene.splatting_properties.active_instance_index = len(context.scene.splatting_instances) - 1
+        self.report({'INFO'}, f"Added '{obj.name}'")
+        return {'FINISHED'}
+
+
+class SPLATTING_OT_remove_instance(types.Operator):
+    bl_idname = "splatting.remove_instance"
+    bl_label = "Remove Splat Instance"
+    bl_description = "Remove this splat instance from the list"
+
+    def execute(self, context):
+        props = context.scene.splatting_properties
+        idx = props.active_instance_index
+        instances = context.scene.splatting_instances
+        if 0 <= idx < len(instances):
+            item = instances[idx]
+            name = item.mesh_name
+            instances.remove(idx)
+            n = len(instances)
+            props.active_instance_index = min(idx, n - 1)
+            self.report({'INFO'}, f"Removed '{name}'")
+        return {'FINISHED'}
+
+
+class SPLATTING_OT_move_instance(types.Operator):
+    bl_idname = "splatting.move_instance"
+    bl_label = "Move Instance"
+    bl_description = "Change render order of this instance"
+
+    direction: bpy.props.EnumProperty(
+        items=[
+            ('UP', 'Up', 'Move earlier in the list'),
+            ('DOWN', 'Down', 'Move later in the list'),
+        ],
+    )
+
+    def execute(self, context):
+        props = context.scene.splatting_properties
+        idx = props.active_instance_index
+        items = context.scene.splatting_instances
+        n = len(items)
+        if n < 2:
+            return {'CANCELLED'}
+        new_idx = idx
+        if self.direction == 'UP' and idx > 0:
+            items.move(idx, idx - 1)
+            new_idx = idx - 1
+        elif self.direction == 'DOWN' and idx < n - 1:
+            items.move(idx, idx + 1)
+            new_idx = idx + 1
+        else:
+            return {'CANCELLED'}
+        props.active_instance_index = new_idx
+
+        # Reorder runtime instances too
+        from .splatting_data import get_state
+        scene = get_state()
+        if scene.is_rendering and len(scene.instances) == n:
+            a, b = new_idx, idx
+            scene.instances[a], scene.instances[b] = scene.instances[b], scene.instances[a]
+
+        return {'FINISHED'}
+
+
+class SPLATTING_OT_toggle_instance(types.Operator):
+    bl_idname = "splatting.toggle_instance"
+    bl_label = "Toggle Instance Visibility"
+    bl_description = "Show/hide this splat instance"
+
+    index: bpy.props.IntProperty(default=0)
+
+    def execute(self, context):
+        instances = context.scene.splatting_instances
+        if 0 <= self.index < len(instances):
+            instances[self.index].enabled = not instances[self.index].enabled
+        # Tag redraw so the toggle updates immediately
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+                break
         return {'FINISHED'}
 
 
@@ -106,12 +192,14 @@ class SPLATTING_OT_sort_blocks(types.Operator):
             return {'CANCELLED'}
 
         from . import splatting_data
-        from .gpu_renderer import get_renderer
 
-        splatting_data.get_state()._sort_active = False
+        # Reset sort state for all instances
+        scene = splatting_data.get_state()
+        for inst in scene.instances:
+            inst._sort_active = False
+            inst.clear_cache()
 
         if splatting_data.sort_blocks_far_to_near(camera_pos):
-            get_renderer().clear_cache()
             self.report({'INFO'}, "Blocks sorted far→near")
         else:
             self.report({'WARNING'}, "No splatting data loaded")
@@ -173,7 +261,7 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         _register_capture_handler()
 
         # Delay start so full-area has time to settle
-        self._delay_ticks = 20   # ~1s at 20 Hz
+        self._delay_ticks = 20
         context.window_manager.modal_handler_add(self)
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         return {'RUNNING_MODAL'}
@@ -189,7 +277,6 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
-        # Wait for full-area to settle before capturing first frame
         if self._delay_ticks > 0:
             self._delay_ticks -= 1
             return {'RUNNING_MODAL'}
@@ -211,14 +298,12 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         global _capture_ready
 
         if _capture_ready:
-            # Save current frame
             filepath = os.path.join(self._output_dir, f"frame_{self._current:04d}.png")
             self._save_capture(filepath)
             context.window_manager.progress_update(self._current)
 
             _capture_ready = False
 
-            # Advance
             self._current += 1
             if self._current > self._end:
                 self._finish(context)
@@ -230,7 +315,6 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
                 self._maybe_sort(context)
             self._request_capture()
         else:
-            # Draw not yet completed — re-tag and wait
             if not _capture_requested:
                 self._request_capture()
             else:
@@ -242,11 +326,9 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
     # helpers
     # ------------------------------------------------------------------
     def _maybe_sort(self, context):
-        """Sort blocks far-to-near if camera has moved since last capture."""
+        """Sort all instances far-to-near if camera has moved since last capture."""
         from . import splatting_data
-        from .gpu_renderer import get_renderer
 
-        # Get current camera position from the 3D view
         r3d = None
         area = context.area
         if area and area.type == 'VIEW_3D' and area.spaces.active:
@@ -272,10 +354,12 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
 
         self._last_cam_pos = cam_pos.copy()
 
-        # Sort all blocks for the new camera position
-        splatting_data.get_state()._sort_active = False
-        if splatting_data.sort_blocks_far_to_near(cam_pos):
-            get_renderer().clear_cache()
+        # Reset sort state and sort all instances
+        scene = splatting_data.get_state()
+        for inst in scene.instances:
+            inst._sort_active = False
+            inst.clear_cache()
+        splatting_data.sort_blocks_far_to_near(cam_pos)
 
     def _request_capture(self):
         global _capture_requested
@@ -283,18 +367,15 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         self._view3d_area.tag_redraw()
 
     def _save_capture(self, filepath):
-        # 3D view is maximised to full window — screenshot IS the viewport.
         bpy.ops.screen.screenshot(filepath=filepath)
 
     def _finish(self, context):
-        # Restore overlays
         if hasattr(self, '_orig_show_overlays') and self._space3d:
             try:
                 self._space3d.overlay.show_overlays = self._orig_show_overlays
-            except:
+            except Exception:
                 pass
 
-        # Restore the 3D view UI
         if getattr(self, '_needs_restore', False):
             bpy.ops.screen.screen_full_area(use_hide_panels=True)
             self._needs_restore = False
@@ -311,7 +392,10 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
 _operators = [
     SPLATTING_OT_start_render,
     SPLATTING_OT_stop_render,
-    SPLATTING_OT_select_mesh,
+    SPLATTING_OT_add_instance,
+    SPLATTING_OT_remove_instance,
+    SPLATTING_OT_move_instance,
+    SPLATTING_OT_toggle_instance,
     SPLATTING_OT_sort_blocks,
     SPLATTING_OT_export_animation,
 ]
@@ -323,7 +407,6 @@ def register():
 
 
 def unregister():
-    # Clean up the export capture handler if still active
     _unregister_capture_handler()
     global _capture_ready, _capture_requested
     _capture_ready = False

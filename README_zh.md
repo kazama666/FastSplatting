@@ -37,8 +37,8 @@ Fast Splatting 可处理由外部工具生成的高斯泼溅文件。
 
 1. **导入 PLY 模型** — `文件 → 导入 → PLY (.ply)`，选择一个高斯泼溅 PLY 文件
 2. **添加导入的网格** — 在 3D 视口中选中该网格，然后在侧边栏（`N` 键 → **FastSplatting** 标签页）点击 **+** 按钮将其添加到 **Splat Meshes** 列表
-3. **开始渲染** — 点击 **开始渲染** 初始化 GPU 缓冲区并开始渲染
-4. **停止渲染** — 点击 **停止渲染** 释放 GPU 资源
+3. **Start Render** — 点击 **Start Render** 初始化 GPU 缓冲区并开始渲染
+4. **Stop Render** — 点击 **Stop Render** 释放 GPU 资源
 
 ### 控件
 

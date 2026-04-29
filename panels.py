@@ -13,20 +13,17 @@ class SPLATTING_PT_panel(types.Panel):
         scene = context.scene
         splatting_props = scene.splatting_properties
         
+
         if not splatting_props.is_rendering:
             # Mesh selection
-            layout.label(text="Target Mesh:")
-            row = layout.row()
+            box = layout.box()
+            box.label(text="Initialization Settings", icon='SETTINGS')
+            row = box.row()
+            row.label(text="Splatting Mesh:")
             row.prop(scene, "splatting_target_mesh", text="")
             row.operator("splatting.select_mesh", text="", icon='OBJECT_DATA')
-
-        box = layout.box()
-        box.label(text="Block Settings", icon='SETTINGS')
-        if splatting_props.is_rendering:
-            box.prop(splatting_props, "sort_blocks_per_frame", text="Sort Blocks per Frame")
-        else:
             box.prop(splatting_props, "block_size", text="Block Size")
-        layout.split()
+            layout.split()
 
         # Render controls
         if not splatting_props.is_rendering:
@@ -47,23 +44,19 @@ class SPLATTING_PT_panel(types.Panel):
         layout.separator()
         '''
 
-        # # Quad scale
-        # layout.label(text="Splat Size:")
-        # row = layout.row()
-        # row.prop(splatting_props, "quad_scale", text="Scale", slider=True)
-
         layout.split()
 
         # Color adjustments
-        col_box = layout.box()
-        col_box.label(text="Render Adjust", icon='COLOR')
-        col_box.prop(splatting_props, "color_tint", text="Tint")
-        col_box.prop(splatting_props, "color_brightness", text="Exposure", slider=True)
-        col_box.prop(splatting_props, "color_gamma", text="Gamma", slider=True)
-        col_box.prop(splatting_props, "color_hue", text="Hue", slider=True)
-        col_box.prop(splatting_props, "color_saturation", text="Saturation", slider=True)
-        col_box.split()
-        col_box.prop(splatting_props, "quad_scale", text="Splat Scale", slider=True)
+        color_header, color_body = layout.panel_prop(splatting_props, "ui_color_expanded")
+        color_header.label(text="Render Adjust", icon='COLOR')
+        if color_body:
+            color_body.prop(splatting_props, "color_tint", text="Tint")
+            color_body.prop(splatting_props, "color_brightness", text="Exposure", slider=True)
+            color_body.prop(splatting_props, "color_gamma", text="Gamma", slider=True)
+            color_body.prop(splatting_props, "color_hue", text="Hue", slider=True)
+            color_body.prop(splatting_props, "color_saturation", text="Saturation", slider=True)
+            color_body.split()
+            color_body.prop(splatting_props, "quad_scale", text="Splat Scale", slider=True)
 
         layout.split()
 

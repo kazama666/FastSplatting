@@ -458,6 +458,7 @@ void main() {
         state_obj._proj_00 = proj_00
         state_obj._proj_11 = proj_11
 
+        splatting_props = context.scene.splatting_properties
         # Auto-sort: detect view change and do one batch per frame
         from .splatting_data import check_view_changed, sort_next_batch
         if check_view_changed(view_matrix):
@@ -465,23 +466,21 @@ void main() {
             if state_obj.sorted_up_to >= state_obj.block_count:
                 state_obj.sorted_up_to = 0
         sort_next_batch(context)
-
-        splatting_props = context.scene.splatting_properties
         # lod_enabled = splatting_props.lod_enabled
         # lod_bias = splatting_props.lod_bias
         near_to_far = splatting_props.sort_near_to_far
 
+        # ----- State setup (alpha blend) -----
+        state.blend_set('ALPHA_PREMULT')
         # Vectorized block distance computation
         block_centers = state_obj.block_centers
         block_radii = state_obj.block_radii
         cam_pos_np = state_obj._camera_pos_np
         distances = np.linalg.norm(block_centers - cam_pos_np, axis=1)
-        sorted_order = np.argsort(distances)
+        near_end = distances - block_radii
+        block_order = np.argsort(near_end)
         if not near_to_far:
-            sorted_order = sorted_order[::-1]
-
-        # ----- State setup (alpha blend) -----
-        state.blend_set('ALPHA_PREMULT')
+            block_order = block_order[::-1]
         state.depth_mask_set(False)
         state.depth_test_set('LESS')
 
@@ -500,7 +499,7 @@ void main() {
         self.shader.uniform_float("u_Tint", splatting_props.color_tint)
 
         # ----- Block rendering loop -----
-        # Vectorized frustum culling: compute all clip-space positions at once
+        # Vectorized frustum culling
         count = len(block_centers)
         ones = np.ones((count, 1), dtype=np.float32)
         centers_h = np.concatenate([block_centers, ones], axis=1)
@@ -513,7 +512,7 @@ void main() {
 
         total_drawn = 0
         total_splats = 0
-        for idx in sorted_order:
+        for idx in block_order:
             if not visible_mask[idx]:
                 continue
 

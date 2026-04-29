@@ -1,5 +1,5 @@
-# Fast Splatting
 
+![banner](assets/banner.png)
 High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport using GPU instanced rendering with custom GLSL shaders.
 
 ## Features
@@ -13,21 +13,26 @@ High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport usi
 
 
 ## Installation
+This addon is distributed as a Blender extension.
 
-This addon is distributed as a Blender extension (`.toml` manifest).
-
-1. Clone or download this repository
-2. In Blender, go to **Edit → Preferences → Get Extensions → Install from Disk**
-3. Select the `blender_manifest.toml` file
-4. Enable the addon in **Preferences → Add-ons** (search "Fast Splatting")
-
-Or install as a legacy addon by placing the folder in Blender's `scripts/addons/` directory and enabling it in Preferences.
+1. download zip.
+2. drop the zip into blender's viewport.
+3. confirm install.
 
 ## Usage
 
+### Getting Splat Data
+Fast Splatting works with Gaussian Splat files generated from external tools.
+
+You can generate splats using:
+
+- Tencent Hunyuan (single-image world generation)
+- Any Gaussian Splatting pipeline that exports .ply
+- Scanned data (Polycam, RealityScan, etc.)
+
 ### Quick Start
 
-1. **Import a PLY model** — `File → Import → PLY (.ply)`, select a Gaussian Splatting PLY file (e.g., exported from 3D Gaussian Splatting or PostShot)
+1. **Import a PLY model** — `File → Import → PLY (.ply)`, select a Gaussian Splatting PLY file
 2. **Select the imported mesh** — Select the mesh in the 3D viewport, then in the sidebar (`N` key → **FastSplatting** tab) click the object icon button to set it as target
 3. **Start Render** — Click **Start Render** to initialize GPU buffers and begin rendering
 4. **Stop Render** — Click **Stop Render** to release GPU resources
@@ -37,7 +42,6 @@ Or install as a legacy addon by placing the folder in Blender's `scripts/addons/
 | Control | Description |
 |---|---|
 | Block Size | Grid cell size for spatial partitioning (requires restart render) |
-| Sort Blocks per Frame | Number of blocks sorted per frame during auto-sort; higher = faster convergence, lower = smoother fps |
 | Tint | RGB color multiplier |
 | Exposure | Brightness multiplier |
 | Gamma | Gamma correction |
@@ -63,7 +67,7 @@ While rendering, the panel shows total and displayed block/splat counts.
 ```
 Fast Splatting/
 ├── __init__.py           # Plugin metadata, registration
-├── operators.py          # Blender operators (render control, sort, export animation)
+├── operators.py          # Blender operators
 ├── panels.py             # UI sidebar panel, scene properties
 ├── splatting_data.py     # Data loading, spatial index, state management, sorting
 ├── gpu_renderer.py       # GPU batch building, GLSL shader, draw loop
@@ -73,17 +77,7 @@ Fast Splatting/
 ## Performance Notes
 
 - Splat count and block size determine memory and draw-call overhead. Larger block size = fewer blocks = fewer draw calls but coarser culling
-- The initial sort after loading or large camera moves may take several frames to converge; **Sort Blocks per Frame** controls the tradeoff
-
-### Getting Splat Data
-
-Fast Splatting works with Gaussian Splat files generated from external tools.
-
-You can generate splats using:
-
-- Tencent Hunyuan (single-image world generation)
-- Any Gaussian Splatting pipeline that exports .ply
-- Scanned data (Polycam, RealityScan, etc.)
+- The initial sort after loading or large camera moves may take several frames to converge;
 
 ## License
 GPL-3.0

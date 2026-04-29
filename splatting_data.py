@@ -98,8 +98,6 @@ class SplattingProperties(types.PropertyGroup):
     quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0)
     block_size: bpy.props.FloatProperty(default=0.5, min=0.1, max=5.0, step=0.1,
         description="Spatial block size for culling. Larger = fewer blocks, fewer draw calls. Requires restart")
-    sort_blocks_per_frame: bpy.props.IntProperty(default=32, min=0, max=200,
-        description="Number of blocks to sort per frame during auto-sort (0 = disable)")
     color_gamma: bpy.props.FloatProperty(default=1.0, min=0.0, max=5.0, step=0.1,
         description="Gamma correction")
     color_hue: bpy.props.FloatProperty(default=0.0, min=-1.0, max=1.0, step=0.01,
@@ -120,6 +118,8 @@ class SplattingProperties(types.PropertyGroup):
         description="Sort blocks far-to-near every frame when camera changes")
     ui_export_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle export animation section")
+    ui_color_expanded: bpy.props.BoolProperty(default=True,
+        description="Toggle color adjustment section")
     ui_stats_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle statistics section")
 
@@ -378,6 +378,9 @@ def start_render(context):
     if not mesh_name:
         return
 
+    print("start render")
+    
+
     obj = bpy.data.objects.get(mesh_name)
     if not obj or obj.type != 'MESH':
         return
@@ -491,6 +494,20 @@ def get_lod_levels():
     return LOD_LEVELS
 
 
+def _sort_blocks(cp_np, block_range):
+    """Sort splats in given blocks far-to-near by distance² minus scale sum."""
+    pos = _state.positions
+    for i in block_range:
+        indices = _state.block_splat_indices[i]
+        if len(indices) < 2:
+            continue
+        diff = pos[indices] - cp_np
+        dists = np.sum(diff * diff, axis=1)
+        dists = dists + _state.scales[indices].sum(axis=1)
+        order = np.argsort(dists)[::-1]  # far to near
+        _state.block_splat_indices[i] = indices[order]
+
+
 def sort_blocks_far_to_near(camera_pos):
     """Sort splats inside each block by distance from camera (far to near).
     Returns True if sorting was performed."""
@@ -499,22 +516,8 @@ def sort_blocks_far_to_near(camera_pos):
         return False
 
     t0 = time.perf_counter()
-    pos = _state.positions
     cp = np.array([camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
-    for i in range(_state.block_count):
-        indices = _state.block_splat_indices[i]
-        if len(indices) < 2:
-            continue
-        diff = pos[indices] - cp
-        dists = np.sum(diff * diff, axis=1)
-        order = np.argsort(dists)[::-1]  # far to near
-        _state.block_splat_indices[i] = indices[order]
-
-    # Rebuild LOD data — disabled
-    # _state.lod_data = build_lod_data(
-    #     _state.positions, _state.colors, _state.opacities,
-    #     _state.scales, _state.rotations, _state.block_splat_indices)
-
+    _sort_blocks(cp, range(_state.block_count))
     t = time.perf_counter() - t0
     print(f"[Splatting] Sort far→near: {t*1000:.1f}ms")
     return True
@@ -543,12 +546,6 @@ def sort_next_batch(context):
         _stop_redraw_timer()
         return
 
-    per_frame = context.scene.splatting_properties.sort_blocks_per_frame
-    if per_frame <= 0:
-        _state._sort_active = False
-        _stop_redraw_timer()
-        return
-
     cp_np = _state._camera_pos_np
     if cp_np is None:
         _state._sort_active = False
@@ -557,9 +554,8 @@ def sort_next_batch(context):
 
     _start_redraw_timer()
 
-    end = min(_state.sorted_up_to + per_frame, _state.block_count)
-    pos = _state.positions
-    block_range = np.arange(_state.sorted_up_to, end, dtype=np.intp)
+    SORT_BUDGET_MS = 5.0
+    block_range = np.arange(_state.sorted_up_to, _state.block_count, dtype=np.intp)
 
     # Prioritise visible blocks via vectorised frustum test
     vp = _state._vp_matrix
@@ -580,19 +576,18 @@ def sort_next_batch(context):
         )
         block_range = np.concatenate([block_range[in_frustum], block_range[~in_frustum]])
 
-    for i in block_range:
-        indices = _state.block_splat_indices[i]
-        if len(indices) < 2:
-            continue
-        diff = pos[indices] - cp_np
-        dists = np.sum(diff * diff, axis=1)
-        order = np.argsort(dists)[::-1]
-        _state.block_splat_indices[i] = indices[order]
+    t_start = time.perf_counter()
+    sorted_blocks = []
+    for idx in block_range:
+        _sort_blocks(cp_np, np.array([idx], dtype=np.intp))
+        sorted_blocks.append(int(idx))
+        if (time.perf_counter() - t_start) * 1000 >= SORT_BUDGET_MS:
+            break
 
-    _state.sorted_up_to = int(end)
+    _state.sorted_up_to = sorted_blocks[-1] + 1 if sorted_blocks else _state.sorted_up_to
 
     from .gpu_renderer import get_renderer
-    get_renderer().clear_block_cache(block_range.tolist())
+    get_renderer().clear_block_cache(sorted_blocks)
 
     if _state.sorted_up_to >= _state.block_count:
         _state._sort_active = False

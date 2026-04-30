@@ -19,6 +19,7 @@ High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport.
 - Blender 5.0+
 - macOS
 - Windows
+- Linux
 
 ## Installation
 This addon is distributed as a Blender extension.

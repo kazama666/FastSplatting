@@ -19,6 +19,7 @@
 - Blender 5.0+
 - macOS
 - Windows
+- Linux
 
 ## 安装
 

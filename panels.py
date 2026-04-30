@@ -85,9 +85,6 @@ class SPLATTING_PT_panel(types.Panel):
         else:
             layout.operator("splatting.stop_render", text="Stop Render", icon='CANCEL')
 
-        # --- Grid preview (always visible) ---
-        
-
         layout.separator()
 
         # Color adjustments

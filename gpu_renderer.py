@@ -346,9 +346,7 @@ void main() {
         scene.displayed_block_count = total_drawn_blocks
         scene.displayed_splat_count = total_drawn_splats
 
-        # --- Reset state ---
-        state.depth_test_set('LESS')
-        state.depth_mask_set(False)
+        # --- Reset blend (depth state already restored above) ---
         state.blend_set('NONE')
 
     def release(self):
@@ -378,6 +376,17 @@ def draw_splatting(context):
     _renderer.draw(context)
 
 
+def _steps(start, end, step):
+    """Generate evenly spaced values from start to end (inclusive) at given step."""
+    if step <= 0:
+        return [start]
+    pos, vals = start, []
+    while pos <= end + 1e-6:
+        vals.append(pos)
+        pos += step
+    return vals
+
+
 # ---------------------------------------------------------------------------
 # Block grid overlay (POST_VIEW draw handler)
 # ---------------------------------------------------------------------------
@@ -402,7 +411,7 @@ def _grid_draw():
 
     offset = np.array(props.block_offset, dtype=np.float32)
 
-    # Compute world-space bounding box from splat instance meshes
+    # Compute world-space bounding box from mesh bound_box (fast — 8 corners)
     items = scene.splatting_instances
     if not items:
         return
@@ -433,15 +442,6 @@ def _grid_draw():
 
     origin = min_coords + offset
     bs = block_size
-
-    def _steps(start, end, step):
-        if step <= 0:
-            return [start]
-        pos, vals = start, []
-        while pos <= end + 1e-6:
-            vals.append(pos)
-            pos += step
-        return vals
 
     xs = _steps(origin[0], max_coords[0], bs)
     ys = _steps(origin[1], max_coords[1], bs)

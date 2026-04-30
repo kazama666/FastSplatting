@@ -176,7 +176,8 @@ void main() {
         self._matrices_ubo.update(data)
 
     def draw(self, context):
-        """Draw all splat instances."""
+        """Draw all splat instances with global block-level sorting for correct
+        alpha blending across objects."""
         if not self.initialized or self.shader is None:
             return
 
@@ -239,16 +240,31 @@ void main() {
         self.shader.uniform_float("u_ViewportSize", (vp_w, vp_h))
 
         near_to_far = splatting_props.sort_near_to_far
+
+        # --- World-space camera position (same for all instances) ---
+        if camera:
+            camera_pos_world = camera.matrix_world.translation
+        else:
+            view_matrix_inv = region3d.view_matrix.inverted()
+            camera_pos_world = view_matrix_inv.translation
+        camera_world_np = np.array(
+            [camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]], dtype=np.float32)
+
+        # =====================================================================
+        # Phase 1: Collect visible blocks from all instances
+        # =====================================================================
+        draw_entries = []      # (inst_idx, block_idx, sort_key)
+        inst_data = {}         # inst_idx -> per-instance draw info
+        inst_drawn_blocks = {}
+        inst_drawn_splats = {}
         total_drawn_blocks = 0
         total_drawn_splats = 0
 
-        for inst in scene.instances:
-            if inst.point_count == 0:
-                continue
-            if inst.target_mesh is None:
+        for inst_idx, inst in enumerate(scene.instances):
+            if inst.point_count == 0 or inst.target_mesh is None:
                 continue
 
-            # Check UI toggle (enable/disable instances at runtime)
+            # Check UI toggle
             ui_item = None
             for item in context.scene.splatting_instances:
                 if item.mesh_name == inst.target_mesh.name:
@@ -257,37 +273,21 @@ void main() {
             if ui_item is None or not ui_item.enabled:
                 continue
 
-            # --- Per-instance uniforms ---
-            self.shader.uniform_float("u_QuadScale", ui_item.quad_scale)
-            self.shader.uniform_float("u_Gamma", ui_item.color_gamma)
-            self.shader.uniform_float("u_Hue", ui_item.color_hue)
-            self.shader.uniform_float("u_Saturation", ui_item.color_saturation)
-            self.shader.uniform_float("u_Brightness", ui_item.color_brightness)
-            self.shader.uniform_float("u_Tint", ui_item.color_tint)
-
-            # --- Per-instance matrices ---
+            # Per-instance matrices
             model_matrix = inst.target_mesh.matrix_world.copy()
             inst_vp = vp_matrix @ model_matrix
             inst_view = view_matrix @ model_matrix
             camera_pos_local = inst_view.inverted().translation
 
-            # Local-space camera for per-splat sorting
+            # Camera positions for auto-sort
             inst._camera_pos_np = np.array(
                 [camera_pos_local[0], camera_pos_local[1], camera_pos_local[2]], dtype=np.float32)
-
-            # World-space camera for block-level operations (partition is in world space)
-            if camera:
-                camera_pos_world = camera.matrix_world.translation
-            else:
-                view_matrix_inv = region3d.view_matrix.inverted()
-                camera_pos_world = view_matrix_inv.translation
-            inst._camera_world_np = np.array(
-                [camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]], dtype=np.float32)
+            inst._camera_world_np = camera_world_np
             inst._vp_world = vp_matrix
             inst._proj_00 = proj_00
             inst._proj_11 = proj_11
 
-            # --- Auto-sort ---
+            # Auto-sort
             from .splatting_data import check_view_changed, sort_next_batch
             if check_view_changed(inst, inst_view):
                 inst._sort_active = True
@@ -295,58 +295,96 @@ void main() {
                     inst.sorted_up_to = 0
             sort_next_batch(inst, context)
 
-            # --- Block ordering (far-to-near by near-end distance, world space) ---
-            distances = np.linalg.norm(inst.block_centers - inst._camera_world_np, axis=1)
+            # Block ordering (by near-end distance from camera, world space)
+            distances = np.linalg.norm(inst.block_centers - camera_world_np, axis=1)
             near_end = distances - inst.block_radii
             block_order = np.argsort(near_end)
             if not near_to_far:
                 block_order = block_order[::-1]
 
-            # --- Vectorized frustum culling (world space) ---
+            # Vectorized frustum culling (world space)
             count = len(inst.block_centers)
             ones = np.ones((count, 1), dtype=np.float32)
             centers_h = np.concatenate([inst.block_centers, ones], axis=1)
             vp_np = np.asarray(vp_matrix, dtype=np.float32)
             clip_pos = centers_h @ vp_np.T
-
             visible_mask = (clip_pos[:, 3] > 0) & \
                 (np.abs(clip_pos[:, 0]) < clip_pos[:, 3] + inst.block_radii * proj_00) & \
                 (np.abs(clip_pos[:, 1]) < clip_pos[:, 3] + inst.block_radii * proj_11)
 
-            # --- Update UBO + draw this instance ---
-            self._update_matrices_ubo(inst_vp, inst_view)
-            self.shader.uniform_block('u_Matrices', self._matrices_ubo)
-            self.shader.uniform_float("u_CameraPos", camera_pos_local)
-
-            drawn = 0
-            splats = 0
+            # Collect visible block entries
+            sort_sign = 1.0 if near_to_far else -1.0
             for idx in block_order:
-                if not visible_mask[idx]:
-                    continue
-                batch = inst._get_or_create_block_batch(idx)
-                if batch:
-                    batch.draw(self.shader)
-                    drawn += 1
-                    splats += max(1, len(inst.block_splat_indices[idx]))
+                if visible_mask[idx]:
+                    draw_entries.append((inst_idx, idx, near_end[idx] * sort_sign))
 
-            # Fallback
-            if drawn == 0 and inst.point_count > 0:
+            inst_data[inst_idx] = {
+                'vp': inst_vp,
+                'view': inst_view,
+                'cam_local': camera_pos_local,
+                'ui': ui_item,
+                'inst': inst,
+            }
+            inst_drawn_blocks[inst_idx] = 0
+            inst_drawn_splats[inst_idx] = 0
+
+        # =====================================================================
+        # Phase 2: Global sort by distance across all instances
+        # =====================================================================
+        draw_entries.sort(key=lambda x: x[2])
+
+        # =====================================================================
+        # Phase 3: Draw with per-instance uniform switching
+        # =====================================================================
+        current_inst_idx = -1
+        for inst_idx, block_idx, _ in draw_entries:
+            data = inst_data[inst_idx]
+
+            if inst_idx != current_inst_idx:
+                # Rebind per-instance uniforms and matrices
+                self.shader.uniform_float("u_QuadScale", data['ui'].quad_scale)
+                self.shader.uniform_float("u_Gamma", data['ui'].color_gamma)
+                self.shader.uniform_float("u_Hue", data['ui'].color_hue)
+                self.shader.uniform_float("u_Saturation", data['ui'].color_saturation)
+                self.shader.uniform_float("u_Brightness", data['ui'].color_brightness)
+                self.shader.uniform_float("u_Tint", data['ui'].color_tint)
+
+                self._update_matrices_ubo(data['vp'], data['view'])
+                self.shader.uniform_block('u_Matrices', self._matrices_ubo)
+                self.shader.uniform_float("u_CameraPos", data['cam_local'])
+                current_inst_idx = inst_idx
+
+            batch = data['inst']._get_or_create_block_batch(block_idx)
+            if batch:
+                batch.draw(self.shader)
+                inst_drawn_blocks[inst_idx] += 1
+                splats = max(1, len(data['inst'].block_splat_indices[block_idx]))
+                inst_drawn_splats[inst_idx] += splats
+                total_drawn_blocks += 1
+                total_drawn_splats += splats
+
+        # Fallback for instances with no visible blocks
+        for inst_idx, data in inst_data.items():
+            inst = data['inst']
+            if inst_drawn_blocks[inst_idx] == 0 and inst.point_count > 0:
                 batch = inst._get_or_create_fallback_batch()
                 if batch:
                     batch.draw(self.shader)
-                    drawn = inst.block_count
-                    splats = max(1, inst.point_count // 16)
+                    inst_drawn_blocks[inst_idx] = inst.block_count
+                    inst_drawn_splats[inst_idx] = max(1, inst.point_count // 16)
+                    total_drawn_blocks += inst_drawn_blocks[inst_idx]
+                    total_drawn_splats += inst_drawn_splats[inst_idx]
 
-            inst.displayed_block_count = drawn
-            inst.displayed_splat_count = splats
-            total_drawn_blocks += drawn
-            total_drawn_splats += splats
+        # Update per-instance stats
+        for inst_idx, data in inst_data.items():
+            data['inst'].displayed_block_count = inst_drawn_blocks[inst_idx]
+            data['inst'].displayed_splat_count = inst_drawn_splats[inst_idx]
 
         # Update scene-level stats
         scene.displayed_block_count = total_drawn_blocks
         scene.displayed_splat_count = total_drawn_splats
 
-        # --- Reset blend (depth state already restored above) ---
+        # --- Reset blend ---
         state.blend_set('NONE')
 
     def release(self):

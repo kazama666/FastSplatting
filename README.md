@@ -45,7 +45,7 @@ You can generate splats using:
 3. **Start Render** — Click **Start Render** to initialize GPU buffers and begin rendering
 4. **Stop Render** — Click **Stop Render** to release GPU resources
 
-- Test on MacBook Air M1 for 1.4M splats:
+- Tested on MacBook Air M1 for 1.4M splats:
 ![testFastSplatting](assets/testFastSplatting.webp)
 
 ### Controls

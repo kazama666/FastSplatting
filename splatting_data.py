@@ -46,7 +46,7 @@ class SplattingState:
         self._sort_active = False
         self._camera_pos_np = None
         self._prev_view_matrix = None
-        self._vp_matrix = None
+        self._vp_world = None
         self._proj_00 = 0.0
         self._proj_11 = 0.0
 
@@ -71,7 +71,7 @@ class SplattingState:
         self._sort_active = False
         self._camera_pos_np = None
         self._prev_view_matrix = None
-        self._vp_matrix = None
+        self._vp_world = None
         self._proj_00 = 0.0
         self._proj_11 = 0.0
         self._batch_cache = {}
@@ -262,7 +262,6 @@ class SplattingScene:
         self.is_rendering = False
         self._draw_handle = None
         self._target_area = None
-        self._target_space = None     # for background color restore
         self._redraw_timer = None
 
         # Aggregated stats (set by renderer each frame)
@@ -270,14 +269,13 @@ class SplattingScene:
         self.displayed_splat_count = 0
 
     def clear(self):
+        """Clear splat data. Does NOT remove draw handlers/timers — callers manage them."""
         for inst in self.instances:
             inst.clear()
         self.instances.clear()
         self.is_rendering = False
-        self._draw_handle = None
-        self._target_area = None
-        self._target_space = None
-        self._redraw_timer = None
+        self.displayed_block_count = 0
+        self.displayed_splat_count = 0
 
 
 _scene = SplattingScene()
@@ -372,13 +370,36 @@ def _on_id_renamed():
         _tag_view3d_redraw()
 
 
+@bpy.app.handlers.persistent
 def _on_load_post(dummy):
     """Recover mesh_uid after loading a .blend file (session_uid not persisted)."""
     for scn in bpy.data.scenes:
+        # Reset rendering state — runtime resources (GPU, handlers) don't survive file load
+        scn.splatting_properties.is_rendering = False
+        scn.splatting_properties.point_count = 0
+        scn.splatting_properties.block_count = 0
         for item in scn.splatting_instances:
             obj = bpy.data.objects.get(item.mesh_name)
             if obj:
                 item.mesh_uid = obj.session_uid
+
+
+@bpy.app.handlers.persistent
+def _on_depsgraph_update(scene, depsgraph):
+    """Remove instances whose mesh objects have been deleted from the scene."""
+    instances = scene.splatting_instances
+    if not instances:
+        return
+    removed = False
+    for i in range(len(instances) - 1, -1, -1):
+        item = instances[i]
+        if item.mesh_name and bpy.data.objects.get(item.mesh_name) is None:
+            instances.remove(i)
+            removed = True
+    if removed:
+        props = scene.splatting_properties
+        if props.active_instance_index >= len(instances):
+            props.active_instance_index = max(0, len(instances) - 1)
 
 
 def register():
@@ -397,6 +418,8 @@ def register():
     )
     # Recover uids after .blend load
     bpy.app.handlers.load_post.append(_on_load_post)
+    # Track object deletion to auto-remove instances
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
 
     from .gpu_renderer import register_grid_draw
     register_grid_draw()
@@ -418,12 +441,15 @@ def unregister():
         release_renderer()
     except Exception:
         pass
+    _scene.is_rendering = False
     _scene.clear()
 
     # Clean up msgbus subscription and handlers
     bpy.msgbus.clear_by_owner(_msgbus_owner)
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
 
     if hasattr(bpy.types.Scene, "splatting_instances"):
         del bpy.types.Scene.splatting_instances
@@ -441,8 +467,7 @@ def read_ply_attributes(mesh):
     vertex_count = len(mesh.vertices)
 
     positions = np.zeros((vertex_count, 3), dtype=np.float32)
-    for i, vert in enumerate(mesh.vertices):
-        positions[i] = vert.co
+    mesh.vertices.foreach_get("co", positions.ravel())
 
     attributes = mesh.attributes
     attr_names = [attr.name for attr in attributes]
@@ -584,12 +609,16 @@ def build_spatial_index(positions, block_size=1.0, origin_offset=None, use_paral
 # Draw handler
 # ---------------------------------------------------------------------------
 def _draw_handler():
-    context = bpy.context
-    area = context.area
-    if area and area.type == 'VIEW_3D' and area == _scene._target_area:
-        from .gpu_renderer import draw_splatting
-        draw_splatting(context)
-        area.tag_redraw()
+    try:
+        context = bpy.context
+        area = context.area
+        if area and area.type == 'VIEW_3D' and area == _scene._target_area:
+            from .gpu_renderer import draw_splatting
+            draw_splatting(context)
+            area.tag_redraw()
+    except ReferenceError:
+        # Target area was freed (e.g. new file loaded while rendering)
+        _emergency_stop()
 
 
 def _tag_view3d_redraw():
@@ -743,12 +772,47 @@ def stop_render(context):
     from .gpu_renderer import release_renderer
     release_renderer()
 
+    _scene.is_rendering = False
     _scene.clear()
     context.scene.splatting_properties.is_rendering = False
     context.scene.splatting_properties.point_count = 0
     context.scene.splatting_properties.block_count = 0
 
     _tag_view3d_redraw()
+
+
+def _emergency_stop():
+    """Safe cleanup when draw handler detects a freed Area (e.g. new file loaded)."""
+    global _scene
+    _stop_redraw_timer()
+    if _scene._draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_scene._draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        _scene._draw_handle = None
+    _scene.is_rendering = False
+    _scene._target_area = None
+    _scene.displayed_block_count = 0
+    _scene.displayed_splat_count = 0
+    try:
+        from .gpu_renderer import release_renderer
+        release_renderer()
+    except Exception:
+        pass
+    # Defer scene property reset — may be called from draw context where
+    # writing to ID properties is not allowed.
+    if not bpy.app.timers.is_registered(_deferred_reset_props):
+        bpy.app.timers.register(_deferred_reset_props, first_interval=0.0)
+
+
+def _deferred_reset_props():
+    """One-shot timer to reset scene properties outside of draw context."""
+    for scn in bpy.data.scenes:
+        scn.splatting_properties.is_rendering = False
+        scn.splatting_properties.point_count = 0
+        scn.splatting_properties.block_count = 0
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -783,11 +847,14 @@ def sort_blocks_far_to_near(camera_pos):
         if inst.point_count == 0:
             continue
         # Transform world camera position to instance local space
-        if inst.target_mesh:
-            local_cam = inst.target_mesh.matrix_world.inverted() @ camera_pos
-            cp = np.array([local_cam[0], local_cam[1], local_cam[2]], dtype=np.float32)
-        else:
-            cp = np.array([camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
+        try:
+            if inst.target_mesh:
+                local_cam = inst.target_mesh.matrix_world.inverted() @ camera_pos
+                cp = np.array([local_cam[0], local_cam[1], local_cam[2]], dtype=np.float32)
+            else:
+                cp = np.array([camera_pos[0], camera_pos[1], camera_pos[2]], dtype=np.float32)
+        except ReferenceError:
+            continue
         _sort_blocks(inst, cp, range(inst.block_count))
     t = time.perf_counter() - t0
     print(f"[Splatting] Sort far→near: {t*1000:.1f}ms")
@@ -891,6 +958,16 @@ def _redraw_tick():
     if not _scene.is_rendering:
         _scene._redraw_timer = None
         return None
+
+    # Check that the target area is still valid (survives new-file load)
+    if _scene._target_area is not None:
+        try:
+            _ = _scene._target_area.type
+        except ReferenceError:
+            _emergency_stop()
+            _scene._redraw_timer = None
+            return None
+
     # Check if any instance still needs sorting
     any_active = False
     for inst in _scene.instances:

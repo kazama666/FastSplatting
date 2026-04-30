@@ -3,7 +3,7 @@ bl_info = {
     "author": "Kazama666",
     "description": "High-performance Gaussian Splatting viewer for Blender",
     "blender": (4, 2, 0),
-    "version": (0, 6, 1),
+    "version": (0, 6, 2),
     "location": "3D Viewport > Sidebar > FastSplatting",
     "warning": "",
     "category": "3D View",
@@ -12,10 +12,11 @@ bl_info = {
 # Support hot-reload for development
 if "bpy" in locals():
     import importlib
-    from . import operators, panels, splatting_data
+    from . import operators, panels, splatting_data, gpu_renderer
     importlib.reload(operators)
     importlib.reload(panels)
     importlib.reload(splatting_data)
+    importlib.reload(gpu_renderer)
 else:
     from . import operators
     from . import panels

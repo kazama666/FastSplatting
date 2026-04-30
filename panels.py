@@ -36,6 +36,15 @@ class SPLATTING_PT_panel(types.Panel):
         scene = context.scene
         splatting_props = scene.splatting_properties
 
+        # Stale rendering state from file load (splatting_props persisted,
+        # but runtime _scene was reset) — auto-correct via deferred timer since
+        # writing to ID properties is not allowed during panel draw.
+        if splatting_props.is_rendering:
+            from .splatting_data import get_state, _deferred_reset_props
+            if not get_state().is_rendering:
+                if not bpy.app.timers.is_registered(_deferred_reset_props):
+                    bpy.app.timers.register(_deferred_reset_props, first_interval=0.0)
+
         # --- Splat instances (collapsible) ---
         meshes_header, meshes_body = layout.panel_prop(splatting_props, "ui_meshes_expanded")
         meshes_header.label(text="Splat Meshes", icon='OBJECT_DATA')
@@ -133,14 +142,16 @@ class SPLATTING_PT_panel(types.Panel):
             stats_header, stats_body = layout.panel_prop(splatting_props, "ui_stats_expanded")
             stats_header.label(text="Statistics", icon='INFO')
             if stats_body:
-                # Only count enabled instances
+                # Only count enabled instances (target_mesh may be freed)
                 enabled_names = {item.mesh_name for item in scene.splatting_instances if item.enabled}
-                total_points = sum(
-                    inst.point_count for inst in scene_state.instances
-                    if inst.target_mesh and inst.target_mesh.name in enabled_names)
-                total_blocks = sum(
-                    inst.block_count for inst in scene_state.instances
-                    if inst.target_mesh and inst.target_mesh.name in enabled_names)
+                total_points = total_blocks = 0
+                for inst in scene_state.instances:
+                    try:
+                        if inst.target_mesh and inst.target_mesh.name in enabled_names:
+                            total_points += inst.point_count
+                            total_blocks += inst.block_count
+                    except ReferenceError:
+                        continue
                 stats_body.label(
                     text=f"Total: {total_blocks:,} blocks, {total_points:,} splats")
                 stats_body.label(

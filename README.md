@@ -2,7 +2,7 @@
 **English** | [中文](README_zh.md)
 
 ![banner](assets/banner.png)
-High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport using GPU instanced rendering with custom GLSL shaders.
+High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport.
 
 ## Features
 
@@ -13,6 +13,12 @@ High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport usi
 - **Animation Export** — Export 3D viewport frames as PNG image sequences with optional per-frame sorting
 - **GPU Instancing** — All splats batched into per-block GPU batches with precomputed 3D covariance on CPU
 
+## Compatibility
+
+- Blender 4.2+
+- Blender 5.0+
+- macOS
+- Windows
 
 ## Installation
 This addon is distributed as a Blender extension.

@@ -47,8 +47,8 @@ Fast Splatting 可处理由外部工具生成的高斯泼溅文件。
 3. **Start Render** — 点击 **Start Render** 初始化 GPU 缓冲区并开始渲染
 4. **Stop Render** — 点击 **Stop Render** 释放 GPU 资源
 
-- Test on MacBook Air M1:
-![testFastSplatting](assets/testFastSplatting.mp4)
+- 在 MacBook Air M1 上运行1.4M 泼溅数据:
+![testFastSplatting](assets/testFastSplatting.webm)
 
 ### 控件
 

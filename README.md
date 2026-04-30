@@ -46,7 +46,7 @@ You can generate splats using:
 4. **Stop Render** — Click **Stop Render** to release GPU resources
 
 - Test on MacBook Air M1:
-![testFastSplatting](assets/testFastSplatting.mp4)
+![testFastSplatting](assets/testFastSplatting.webm)
 
 ### Controls
 

@@ -48,7 +48,7 @@ Fast Splatting 可处理由外部工具生成的高斯泼溅文件。
 4. **Stop Render** — 点击 **Stop Render** 释放 GPU 资源
 
 - 在 MacBook Air M1 上运行1.4M 泼溅数据:
-![testFastSplatting](assets/testFastSplatting.webm)
+![testFastSplatting](assets/testFastSplatting.webp)
 
 ### 控件
 

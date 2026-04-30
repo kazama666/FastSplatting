@@ -1,6 +1,7 @@
+import bpy
 import gpu
 import numpy as np
-from gpu.types import GPUUniformBuf
+from gpu.types import GPUUniformBuf, GPUVertBuf, GPUVertFormat, GPUBatch
 from gpu import state
 from mathutils import Matrix
 
@@ -270,9 +271,19 @@ void main() {
             inst_view = view_matrix @ model_matrix
             camera_pos_local = inst_view.inverted().translation
 
+            # Local-space camera for per-splat sorting
             inst._camera_pos_np = np.array(
                 [camera_pos_local[0], camera_pos_local[1], camera_pos_local[2]], dtype=np.float32)
-            inst._vp_matrix = inst_vp
+
+            # World-space camera for block-level operations (partition is in world space)
+            if camera:
+                camera_pos_world = camera.matrix_world.translation
+            else:
+                view_matrix_inv = region3d.view_matrix.inverted()
+                camera_pos_world = view_matrix_inv.translation
+            inst._camera_world_np = np.array(
+                [camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]], dtype=np.float32)
+            inst._vp_world = vp_matrix
             inst._proj_00 = proj_00
             inst._proj_11 = proj_11
 
@@ -284,18 +295,18 @@ void main() {
                     inst.sorted_up_to = 0
             sort_next_batch(inst, context)
 
-            # --- Block ordering (far-to-near by near-end distance) ---
-            distances = np.linalg.norm(inst.block_centers - inst._camera_pos_np, axis=1)
+            # --- Block ordering (far-to-near by near-end distance, world space) ---
+            distances = np.linalg.norm(inst.block_centers - inst._camera_world_np, axis=1)
             near_end = distances - inst.block_radii
             block_order = np.argsort(near_end)
             if not near_to_far:
                 block_order = block_order[::-1]
 
-            # --- Vectorized frustum culling ---
+            # --- Vectorized frustum culling (world space) ---
             count = len(inst.block_centers)
             ones = np.ones((count, 1), dtype=np.float32)
             centers_h = np.concatenate([inst.block_centers, ones], axis=1)
-            vp_np = np.asarray(inst_vp, dtype=np.float32)
+            vp_np = np.asarray(vp_matrix, dtype=np.float32)
             clip_pos = centers_h @ vp_np.T
 
             visible_mask = (clip_pos[:, 3] > 0) & \
@@ -312,7 +323,7 @@ void main() {
             for idx in block_order:
                 if not visible_mask[idx]:
                     continue
-                batch = inst._get_or_create_block_batch(idx, 0)
+                batch = inst._get_or_create_block_batch(idx)
                 if batch:
                     batch.draw(self.shader)
                     drawn += 1
@@ -365,3 +376,146 @@ def release_renderer():
 
 def draw_splatting(context):
     _renderer.draw(context)
+
+
+# ---------------------------------------------------------------------------
+# Block grid overlay (POST_VIEW draw handler)
+# ---------------------------------------------------------------------------
+_grid_draw_handle = None
+
+
+def _grid_draw():
+    """Draw block grid overlay in 3D viewports."""
+    try:
+        context = bpy.context
+        scene = context.scene
+        props = scene.splatting_properties
+    except AttributeError:
+        return
+
+    if not props.show_block_grid:
+        return
+
+    block_size = props.block_size
+    if block_size <= 0:
+        return
+
+    offset = np.array(props.block_offset, dtype=np.float32)
+
+    # Compute world-space bounding box from splat instance meshes
+    items = scene.splatting_instances
+    if not items:
+        return
+
+    min_coords = None
+    max_coords = None
+    for item in items:
+        if not item.enabled:
+            continue
+        obj = bpy.data.objects.get(item.mesh_name)
+        if obj and obj.type == 'MESH' and len(obj.data.vertices) > 0:
+            bbox_local = np.array(obj.bound_box, dtype=np.float32)
+            mat = np.array(obj.matrix_world, dtype=np.float32)
+            ones = np.ones((8, 1), dtype=np.float32)
+            corners_h = np.concatenate([bbox_local, ones], axis=1)
+            corners_w = (corners_h @ mat.T)[:, :3]
+            obj_min = corners_w.min(axis=0)
+            obj_max = corners_w.max(axis=0)
+            if min_coords is None:
+                min_coords = obj_min.copy()
+                max_coords = obj_max.copy()
+            else:
+                min_coords = np.minimum(min_coords, obj_min)
+                max_coords = np.maximum(max_coords, obj_max)
+
+    if min_coords is None:
+        return
+
+    origin = min_coords + offset
+    bs = block_size
+
+    def _steps(start, end, step):
+        if step <= 0:
+            return [start]
+        pos, vals = start, []
+        while pos <= end + 1e-6:
+            vals.append(pos)
+            pos += step
+        return vals
+
+    xs = _steps(origin[0], max_coords[0], bs)
+    ys = _steps(origin[1], max_coords[1], bs)
+    zs = _steps(origin[2], max_coords[2], bs)
+
+    if len(xs) < 2 and len(ys) < 2 and len(zs) < 2:
+        return
+
+    x_min, x_max = xs[0], xs[-1]
+    y_min, y_max = ys[0], ys[-1]
+    z_min, z_max = zs[0], zs[-1]
+
+    lines = []
+
+    # Parallel to X: at each (y,z) grid intersection
+    for y in ys:
+        for z in zs:
+            lines.append([x_min, y, z])
+            lines.append([x_max, y, z])
+
+    # Parallel to Y: at each (x,z) grid intersection
+    for x in xs:
+        for z in zs:
+            lines.append([x, y_min, z])
+            lines.append([x, y_max, z])
+
+    # Parallel to Z: at each (x,y) grid intersection
+    for x in xs:
+        for y in ys:
+            lines.append([x, y, z_min])
+            lines.append([x, y, z_max])
+
+    if not lines:
+        return
+
+    verts = np.array(lines, dtype=np.float32)
+    fmt = GPUVertFormat()
+    fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+    vbo = GPUVertBuf(fmt, len(verts))
+    vbo.attr_fill(id="pos", data=verts)
+    batch = GPUBatch(type='LINES', buf=vbo)
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    gpu.state.depth_test_set('ALWAYS')
+    gpu.state.blend_set('ALPHA')
+
+    srgb = np.array(props.grid_color, dtype=np.float32)
+    linear = np.sqrt(srgb)
+    color = (*linear, props.grid_alpha)
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+    gpu.state.blend_set('NONE')
+    gpu.state.depth_test_set('LESS')
+
+
+def register_grid_draw():
+    global _grid_draw_handle
+    if _grid_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_grid_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+    _grid_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+        _grid_draw, (), 'WINDOW', 'POST_VIEW'
+    )
+
+
+def unregister_grid_draw():
+    global _grid_draw_handle
+    if _grid_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_grid_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        _grid_draw_handle = None

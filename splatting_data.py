@@ -4,18 +4,12 @@ import time
 import numpy as np
 import bpy
 from bpy import types
-import gpu
 from gpu.types import (
     GPUBatch,
     GPUVertBuf,
     GPUVertFormat,
     GPUIndexBuf,
 )
-
-
-# LOD configuration (disabled)
-LOD_LEVELS = 3
-LOD_THRESHOLDS = [100, 30, 10]
 
 
 # ---------------------------------------------------------------------------
@@ -42,9 +36,6 @@ class SplattingState:
         self.block_centers = None  # (M, 3) center of each block
         self.block_radii = None    # (M,) bounding sphere radius
         self.block_splat_indices = None  # list of np.ndarray
-
-        # LOD data (disabled)
-        self.lod_data = [None] * LOD_LEVELS
 
         # Per-frame stats (updated by renderer during draw)
         self.displayed_block_count = 0
@@ -76,7 +67,6 @@ class SplattingState:
         self.block_centers = None
         self.block_radii = None
         self.block_splat_indices = None
-        self.lod_data = [None] * LOD_LEVELS
         self.sorted_up_to = 0
         self._sort_active = False
         self._camera_pos_np = None
@@ -121,24 +111,21 @@ class SplattingState:
         ])
         return cov_a, cov_b
 
-    def _get_or_create_block_batch(self, block_idx, lod_level):
-        """Get cached batch for a block at given LOD level"""
-        cache_key = ('b', block_idx, lod_level)
+    def _get_or_create_block_batch(self, block_idx):
+        """Get cached batch for a block."""
+        cache_key = ('b', block_idx)
         if cache_key in self._batch_cache:
             return self._batch_cache[cache_key]
 
         block_splat_indices = self.block_splat_indices[block_idx]
-        lod_factor = 4 ** lod_level
-        count = max(1, len(block_splat_indices) // lod_factor)
-        lod_indices = block_splat_indices[:count]
-        if len(lod_indices) == 0:
+        if len(block_splat_indices) == 0:
             return None
 
-        positions = self.positions[lod_indices]
-        colors = self.colors[lod_indices]
-        opacities = self.opacities[lod_indices]
-        scales = self.scales[lod_indices]
-        rotations = self.rotations[lod_indices]
+        positions = self.positions[block_splat_indices]
+        colors = self.colors[block_splat_indices]
+        opacities = self.opacities[block_splat_indices]
+        scales = self.scales[block_splat_indices]
+        rotations = self.rotations[block_splat_indices]
 
         batch = self._build_billboard_batch_for(positions, colors, opacities, scales, rotations)
         self._batch_cache[cache_key] = batch
@@ -150,19 +137,19 @@ class SplattingState:
         if cache_key in self._batch_cache:
             return self._batch_cache[cache_key]
 
-        lod_indices = []
+        fallback_indices = []
         for block_idx in range(self.block_count):
             indices = self.block_splat_indices[block_idx]
             count = max(1, len(indices) // 16)
-            lod_indices.extend(indices[:count])
-        if len(lod_indices) == 0:
+            fallback_indices.extend(indices[:count])
+        if len(fallback_indices) == 0:
             return None
 
-        positions = self.positions[lod_indices]
-        colors = self.colors[lod_indices]
-        opacities = self.opacities[lod_indices]
-        scales = self.scales[lod_indices]
-        rotations = self.rotations[lod_indices]
+        positions = self.positions[fallback_indices]
+        colors = self.colors[fallback_indices]
+        opacities = self.opacities[fallback_indices]
+        scales = self.scales[fallback_indices]
+        rotations = self.rotations[fallback_indices]
 
         batch = self._build_billboard_batch_for(positions, colors, opacities, scales, rotations)
         self._batch_cache[cache_key] = batch
@@ -228,8 +215,7 @@ class SplattingState:
     def clear_block_cache(self, block_indices):
         """Clear cached batches only for specific blocks."""
         for block_idx in block_indices:
-            for lod in range(LOD_LEVELS):
-                self._batch_cache.pop(('b', block_idx, lod), None)
+            self._batch_cache.pop(('b', block_idx), None)
         self._batch_cache.pop(('fallback', 0), None)
 
 
@@ -309,12 +295,37 @@ class SplattingProperties(types.PropertyGroup):
     is_rendering: bpy.props.BoolProperty(default=False)
     point_count: bpy.props.IntProperty(default=0)
     block_count: bpy.props.IntProperty(default=0)
-    lod_enabled: bpy.props.BoolProperty(default=False)
-    lod_bias: bpy.props.FloatProperty(default=1.0, min=0.25, max=4.0, step=0.25,
-        description="LOD threshold multiplier. Higher = more aggressive LOD = faster but lower quality")
     sort_near_to_far: bpy.props.BoolProperty(default=False)
     block_size: bpy.props.FloatProperty(default=0.5, min=0.1, max=5.0, step=0.1,
         description="Spatial block size for culling. Larger = fewer blocks, fewer draw calls. Requires restart")
+    clip_alpha: bpy.props.FloatProperty(
+        name="Clip Alpha",
+        description="Discard splats with opacity below this threshold on init. Reduces splat count and clutter.",
+        default=0.1, min=0.0, max=1.0, step=0.01,
+    )
+    clip_size: bpy.props.FloatProperty(
+        name="Clip Size",
+        description="Discard splats with average scale below this threshold on init.",
+        default=0.0, min=0.0, max=0.1, step=0.001,
+    )
+    show_block_grid: bpy.props.BoolProperty(
+        name="Display Grid",
+        description="Show block grid overlay in the viewport for previewing block boundaries.",
+        default=False,
+    )
+    block_offset: bpy.props.FloatVectorProperty(
+        name="Block Offset",
+        description="Offset the grid origin to shift block boundaries. Adjustable in real-time.",
+        default=(0.0, 0.0, 0.0), size=3, subtype='TRANSLATION',
+    )
+    grid_color: bpy.props.FloatVectorProperty(
+        name="Grid Color",
+        default=(1.0, 0.5, 0.0), size=3, subtype='COLOR', min=0, max=1,
+    )
+    grid_alpha: bpy.props.FloatProperty(
+        name="Grid Alpha",
+        default=0.5, min=0.0, max=1.0,
+    )
     active_instance_index: bpy.props.IntProperty(default=0,
         description="Active index in the splat instances list")
     anim_start_frame: bpy.props.IntProperty(default=1,
@@ -387,8 +398,14 @@ def register():
     # Recover uids after .blend load
     bpy.app.handlers.load_post.append(_on_load_post)
 
+    from .gpu_renderer import register_grid_draw
+    register_grid_draw()
+
 
 def unregister():
+    from .gpu_renderer import unregister_grid_draw
+    unregister_grid_draw()
+
     _stop_redraw_timer()
     if _scene._draw_handle is not None:
         try:
@@ -499,14 +516,22 @@ def _process_block_batch(args):
     return results
 
 
-def build_spatial_index(positions, block_size=1.0, use_parallel=True):
-    """Build spatial index for fast culling."""
+def build_spatial_index(positions, block_size=1.0, origin_offset=None, use_parallel=True):
+    """Build spatial index for fast culling.
+
+    Args:
+        positions: (N, 3) float32 positions in world space.
+        block_size: grid cell size.
+        origin_offset: shift the grid origin by this amount (grid lines at
+                       min_coords + offset + k*block_size).
+    """
     min_coords = positions.min(axis=0)
     max_coords = positions.max(axis=0)
     dimensions = max_coords - min_coords
     grid_dims = np.ceil(dimensions / block_size).astype(int) + 1
 
-    block_idx = ((positions - min_coords) / block_size).astype(int)
+    origin = min_coords if origin_offset is None else min_coords + np.asarray(origin_offset, dtype=np.float32)
+    block_idx = np.floor((positions - origin) / block_size).astype(int)
     block_ids = (block_idx[:, 0] + block_idx[:, 1] * grid_dims[0] +
                  block_idx[:, 2] * grid_dims[0] * grid_dims[1])
 
@@ -578,7 +603,6 @@ def _tag_view3d_redraw():
                     area.tag_redraw()
                     return
 
-
 # ---------------------------------------------------------------------------
 # Start / Stop rendering
 # ---------------------------------------------------------------------------
@@ -619,6 +643,32 @@ def start_render(context):
 
         positions, colors, opacities, scales, rotations = read_ply_attributes(mesh)
 
+        # Clip low-opacity splats
+        clip_val = splatting_props.clip_alpha
+        if clip_val > 0.0:
+            mask = opacities.ravel() >= clip_val
+            kept = mask.sum()
+            if kept < len(positions):
+                positions = positions[mask]
+                colors = colors[mask]
+                opacities = opacities[mask]
+                scales = scales[mask]
+                rotations = rotations[mask]
+                print(f"[Splatting]  Clipped {len(mask) - kept} splats below alpha {clip_val}")
+
+        # Clip small splats by average scale
+        size_val = splatting_props.clip_size
+        if size_val > 0.0:
+            mask = scales.mean(axis=1) >= size_val
+            kept = mask.sum()
+            if kept < len(positions):
+                positions = positions[mask]
+                colors = colors[mask]
+                opacities = opacities[mask]
+                scales = scales[mask]
+                rotations = rotations[mask]
+                print(f"[Splatting]  Clipped {len(mask) - kept} splats below size {size_val}")
+
         inst = SplattingState()
         inst.positions = positions
         inst.colors = colors
@@ -628,15 +678,20 @@ def start_render(context):
         inst.point_count = len(positions)
         inst.target_mesh = obj
 
-        # Build spatial index
-        spatial = build_spatial_index(positions, block_size=block_size, use_parallel=True)
+        # Build spatial index in world space with optional grid offset
+        mat = np.array(obj.matrix_world, dtype=np.float32)
+        ones = np.ones((len(positions), 1), dtype=np.float32)
+        positions_h = np.concatenate([positions, ones], axis=1)
+        positions_world = (positions_h @ mat.T)[:, :3]
+        offset = splatting_props.block_offset
+        spatial = build_spatial_index(positions_world, block_size=block_size,
+                                      origin_offset=offset if any(offset) else None, use_parallel=True)
         inst.block_indices = spatial['block_indices']
         inst.block_centers = spatial['block_centers']
         inst.block_radii = spatial['block_radii']
         inst.block_bounds = spatial['block_bounds']
         inst.block_splat_indices = spatial['block_splat_indices']
         inst.block_count = len(spatial['unique_blocks'])
-        inst.lod_data = None
 
         total_points += inst.point_count
         total_blocks += inst.block_count
@@ -708,7 +763,7 @@ def _sort_blocks(inst, cp_np, block_range):
             continue
         diff = pos[indices] - cp_np
         dists = np.sum(diff * diff, axis=1)
-        dists = dists + inst.scales[indices].sum(axis=1)
+        # dists = dists + inst.scales[indices].sum(axis=1)
         order = np.argsort(dists)[::-1]
         inst.block_splat_indices[i] = indices[order]
 
@@ -770,7 +825,7 @@ def sort_next_batch(inst, context):
     block_range = np.arange(inst.sorted_up_to, inst.block_count, dtype=np.intp)
 
     # Prioritise visible blocks via vectorised frustum test
-    vp = inst._vp_matrix
+    vp = inst._vp_world
     if vp is not None:
         centers = inst.block_centers[block_range]
         radii = inst.block_radii[block_range]

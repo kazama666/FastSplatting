@@ -55,18 +55,38 @@ class SPLATTING_PT_panel(types.Panel):
             col.operator("splatting.move_instance", text="", icon='TRIA_UP').direction = 'UP'
             col.operator("splatting.move_instance", text="", icon='TRIA_DOWN').direction = 'DOWN'
 
+        layout.separator()
+
         # --- Settings (collapsible, only when not rendering) ---
-        if not splatting_props.is_rendering:
-            settings_header, settings_body = layout.panel_prop(splatting_props, "ui_settings_expanded")
-            settings_header.label(text="Settings", icon='SETTINGS')
-            if settings_body:
+        settings_header, settings_body = layout.panel_prop(splatting_props, "ui_settings_expanded")
+        settings_header.label(text="Settings", icon='SETTINGS')
+        if settings_body:
+            settings_body.prop(splatting_props, "show_block_grid", text="Display Grid")
+            if splatting_props.show_block_grid:
+                row = settings_body.row(align=True)
+                row.prop(splatting_props, "grid_color", text="")
+                row.prop(splatting_props, "grid_alpha", text="Alpha")
+              
+            if splatting_props.show_block_grid or not splatting_props.is_rendering: 
+                row = settings_body.row(align=True)
+                row.label(text="Block Offset")
+                row.prop(splatting_props, "block_offset", index=0, text="")
+                row.prop(splatting_props, "block_offset", index=1, text="")
+                row.prop(splatting_props, "block_offset", index=2, text="")
+
+            if not splatting_props.is_rendering:
                 settings_body.prop(splatting_props, "block_size", text="Block Size")
+                settings_body.prop(splatting_props, "clip_alpha", text="Clip Alpha")
+                settings_body.prop(splatting_props, "clip_size", text="Clip Size")
 
         # --- Render controls ---
         if not splatting_props.is_rendering:
             layout.operator("splatting.start_render", text="Start Render", icon='PLAY')
         else:
             layout.operator("splatting.stop_render", text="Stop Render", icon='CANCEL')
+
+        # --- Grid preview (always visible) ---
+        
 
         layout.separator()
 

@@ -3,6 +3,7 @@
 
 ![banner](assets/banner.png)
 High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport.
+A Spark's SPZ(.spz) file format Importer.
 
 ## Features
 

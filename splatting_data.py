@@ -346,7 +346,7 @@ class SplattingProperties(types.PropertyGroup):
     point_count: bpy.props.IntProperty(default=0)
     block_count: bpy.props.IntProperty(default=0)
     sort_near_to_far: bpy.props.BoolProperty(default=False)
-    block_size: bpy.props.FloatProperty(default=0.5, min=0.1, max=5.0, step=0.1,
+    block_size: bpy.props.FloatProperty(default=1.0, min=0.1, max=5.0, step=0.1,
         description="Spatial block size for culling. Larger = fewer blocks, fewer draw calls. Requires restart")
     clip_alpha: bpy.props.FloatProperty(
         name="Clip Alpha",

@@ -109,33 +109,25 @@ void main() {
 }
 """
 
-_EVALUATE_SH_SOURCE = """
-vec3 evaluateSH(sampler2D shTex, int splatId, int texW, int tps, vec3 pos, vec3 camPos, vec3 instColor) {
-    if (tps == 1) {
-        return instColor;
-    }
-    // Degree-1 SH only: 3 bands × 3 RGB = 9 coeffs packed as 3 texel rows.
-    ivec2 tc = ivec2(splatId % texW, (splatId / texW) * tps);
-    vec3 result = texelFetch(shTex, ivec2(tc.x, tc.y + 0), 0).xyz;
-    vec3 dir = normalize(pos - camPos);
-    float x = dir.x, y = dir.y, z = dir.z;
-    const float C1 = 0.4886025119029199;
-    result += texelFetch(shTex, ivec2(tc.x, tc.y + 1), 0).xyz * (-C1 * y);
-    result += texelFetch(shTex, ivec2(tc.x, tc.y + 2), 0).xyz * (C1 * z);
-    result += texelFetch(shTex, ivec2(tc.x, tc.y + 3), 0).xyz * (-C1 * x);
-    result = 1.0 / (1.0 + exp(-result));
-    return pow(max(result, vec3(0.0)), vec3(2.2));
-}
-"""
+
 
 _SIMPLE_VERTEX_SOURCE = _COV2D_SOURCE + """
 void main() {
     v_color = inst_color;
 """ + _COLOR_ADJUST_SOURCE + _RENDER_SOURCE
 
-_FULL_VERTEX_SOURCE = _EVALUATE_SH_SOURCE + _COV2D_SOURCE + """
+_FULL_VERTEX_SOURCE = _COV2D_SOURCE + """
 void main() {
-    v_color = evaluateSH(u_SHTex, int(inst_splat_id), u_SH_TexWidth, u_SH_TexelsPerSplat, inst_position, u_CameraPos, inst_color);
+    // SH1 from 3x VEC4 VBO attributes — no texture needed
+    vec3 dir = normalize(inst_position - u_CameraPos);
+    float x = dir.x, y = dir.y, z = dir.z;
+    const float C1 = 0.4886025119029199;
+    vec3 result = inst_sh_0.xyz                             // DC
+        + vec3(inst_sh_0.w, inst_sh_1.xy) * (-C1 * y)       // Y1-
+        + vec3(inst_sh_1.zw, inst_sh_2.x) * (C1 * z)        // Y10
+        + inst_sh_2.yzw * (-C1 * x);                         // Y11
+    result = 1.0 / (1.0 + exp(-result));
+    v_color = pow(max(result, vec3(0.0)), vec3(2.2));
 """ + _COLOR_ADJUST_SOURCE + _RENDER_SOURCE
 
 
@@ -169,18 +161,17 @@ def _build_shader(vert_out, with_sh):
 
     if with_sh:
         info.push_constant('VEC3', "u_CameraPos")
-        info.sampler(0, 'FLOAT_2D', 'u_SHTex')
-        info.push_constant('INT', "u_SH_TexWidth")
-        info.push_constant('INT', "u_SH_TexelsPerSplat")
 
-    # Vertex inputs (same VBO layout for both)
+    # Vertex inputs (same VBO layout for both shaders)
     info.vertex_in(0, 'VEC2', "quad_coord")
     info.vertex_in(1, 'VEC3', "inst_position")
     info.vertex_in(2, 'VEC3', "inst_color")
     info.vertex_in(3, 'FLOAT', "inst_opacity")
     info.vertex_in(4, 'VEC3', "inst_cov_a")
     info.vertex_in(5, 'VEC3', "inst_cov_b")
-    info.vertex_in(6, 'UINT', "inst_splat_id")
+    info.vertex_in(6, 'VEC4', "inst_sh_0")
+    info.vertex_in(7, 'VEC4', "inst_sh_1")
+    info.vertex_in(8, 'VEC4', "inst_sh_2")
 
     info.vertex_out(vert_out)
     info.fragment_out(0, 'VEC4', "FragColor")
@@ -262,12 +253,7 @@ class SplattingRenderer:
         shader.uniform_block('u_Matrices', self._matrices_ubo)
 
         if is_sh:
-            inst = data['inst']
             shader.uniform_float("u_CameraPos", data['cam_local'])
-            if inst.sh_texture is not None:
-                shader.uniform_sampler('u_SHTex', inst.sh_texture)
-                shader.uniform_int('u_SH_TexWidth', (inst.sh_texture_width,))
-                shader.uniform_int('u_SH_TexelsPerSplat', (inst.sh_texture_tps,))
 
     def draw(self, context):
         """Draw all splat instances with global block-level sorting for correct

@@ -3,7 +3,7 @@ bl_info = {
     "author": "Kazama666",
     "description": "High-performance Gaussian Splatting viewer for Blender",
     "blender": (4, 2, 0),
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "location": "3D Viewport > Sidebar > FastSplatting",
     "warning": "",
     "category": "3D View",

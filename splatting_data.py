@@ -62,12 +62,8 @@ class SplattingState:
 
         # GPU batch cache (per-instance)
         self._batch_cache = {}
-        self.sh_texture = None       # GPUTexture holding raw_dc + SH coefficients
-        self.sh_texture_width = 0    # texture width (for texelFetch coord)
-        self.sh_texture_tps = 0      # texels per splat (1/4/9/16)
 
         # Pre-computed display color for SH0 fast path (sigmoid + gamma 2.2).
-        # Avoids texelFetch + exp + pow in the vertex shader for DC-only splats.
         self.display_colors = None   # (N, 3) float32
 
     def clear(self):
@@ -94,9 +90,6 @@ class SplattingState:
         self._proj_00 = 0.0
         self._proj_11 = 0.0
         self._batch_cache = {}
-        self.sh_texture = None
-        self.sh_texture_width = 0
-        self.sh_texture_tps = 0
         self.display_colors = None
         self._orig_block_centers = None
         self._orig_block_radii = None
@@ -154,8 +147,12 @@ class SplattingState:
         rotations = self.rotations[block_splat_indices]
         colors = self.display_colors[block_splat_indices]
 
+        # SH data for the full shader (VBO attrs, no texture)
+        sh_dc = self.raw_dc[block_splat_indices] if self.raw_dc is not None else None
+        sh_rest = self.sh_coeffs[block_splat_indices] if self.sh_coeffs is not None else None
+
         batch = self._build_billboard_batch_for(
-            positions, opacities, scales, rotations, block_splat_indices, colors)
+            positions, opacities, scales, rotations, colors, sh_dc=sh_dc, sh_rest=sh_rest)
         self._batch_cache[cache_key] = batch
         return batch
 
@@ -177,18 +174,21 @@ class SplattingState:
         opacities = self.opacities[fallback_indices]
         scales = self.scales[fallback_indices]
         rotations = self.rotations[fallback_indices]
-        fallback_ids = np.array(fallback_indices, dtype=np.int32)
+
+        sh_dc = self.raw_dc[fallback_indices] if self.raw_dc is not None else None
+        sh_rest = self.sh_coeffs[fallback_indices] if self.sh_coeffs is not None else None
 
         batch = self._build_billboard_batch_for(
-            positions, opacities, scales, rotations, fallback_ids, self.display_colors[fallback_indices])
+            positions, opacities, scales, rotations,
+            self.display_colors[fallback_indices], sh_dc=sh_dc, sh_rest=sh_rest)
         self._batch_cache[cache_key] = batch
         return batch
 
-    def _build_billboard_batch_for(self, positions, opacities, scales, rotations, splat_ids, display_colors):
-        """Build a single-VBO batch. SH0 display color comes from the pre-computed
-        ``display_colors`` vertex attribute (CPU sigmoid+gamma) to avoid texelFetch
-        + exp + pow in the vertex shader.  ``splat_ids`` is used for higher-degree
-        SH texelFetch when tps > 1."""
+    def _build_billboard_batch_for(self, positions, opacities, scales, rotations, display_colors,
+                                     sh_dc=None, sh_rest=None):
+        """Build a single-VBO batch. SH0 display color comes from ``display_colors``
+        (CPU sigmoid+gamma).  SH1+ coefficients come from ``sh_dc`` (raw DC) and
+        ``sh_rest`` (N×9 float32) packed as VBO attributes — no texture needed."""
         N = len(positions)
         if N == 0:
             return None
@@ -201,8 +201,11 @@ class SplattingState:
             opacities = opacities[mask]
             scales = scales[mask]
             rotations = rotations[mask]
-            splat_ids = splat_ids[mask]
             display_colors = display_colors[mask]
+            if sh_dc is not None:
+                sh_dc = sh_dc[mask]
+            if sh_rest is not None:
+                sh_rest = sh_rest[mask]
             N = len(positions)
             if N == 0:
                 return None
@@ -229,7 +232,11 @@ class SplattingState:
         fmt.attr_add(id="inst_opacity", comp_type='F32', len=1, fetch_mode='FLOAT')
         fmt.attr_add(id="inst_cov_a", comp_type='F32', len=3, fetch_mode='FLOAT')
         fmt.attr_add(id="inst_cov_b", comp_type='F32', len=3, fetch_mode='FLOAT')
-        fmt.attr_add(id="inst_splat_id", comp_type='U32', len=1, fetch_mode='INT')
+        fmt.attr_add(id="inst_sh_0", comp_type='F32', len=4, fetch_mode='FLOAT')
+        fmt.attr_add(id="inst_sh_1", comp_type='F32', len=4, fetch_mode='FLOAT')
+        fmt.attr_add(id="inst_sh_2", comp_type='F32', len=4, fetch_mode='FLOAT')
+
+        zero4 = np.zeros((N * 4, 4), dtype=np.float32)
 
         vbo = GPUVertBuf(fmt, len=N * 4)
         vbo.attr_fill(id="quad_coord", data=np.tile(quad_coords, (N, 1)))
@@ -238,7 +245,17 @@ class SplattingState:
         vbo.attr_fill(id="inst_opacity", data=np.repeat(opacities.ravel(), 4))
         vbo.attr_fill(id="inst_cov_a", data=np.repeat(cov_a, 4, axis=0))
         vbo.attr_fill(id="inst_cov_b", data=np.repeat(cov_b, 4, axis=0))
-        vbo.attr_fill(id="inst_splat_id", data=np.repeat(splat_ids.astype(np.uint32), 4))
+        if sh_dc is not None and sh_rest is not None and sh_rest.shape[1] >= 9:
+            pack0 = np.column_stack([sh_dc, sh_rest[:, 0:1]])        # (N,4): dc.xyz, rest_0
+            pack1 = sh_rest[:, 1:5]                                   # (N,4): rest_1..4
+            pack2 = sh_rest[:, 5:9]                                   # (N,4): rest_5..8
+            vbo.attr_fill(id="inst_sh_0", data=np.repeat(pack0, 4, axis=0))
+            vbo.attr_fill(id="inst_sh_1", data=np.repeat(pack1, 4, axis=0))
+            vbo.attr_fill(id="inst_sh_2", data=np.repeat(pack2, 4, axis=0))
+        else:
+            vbo.attr_fill(id="inst_sh_0", data=zero4)
+            vbo.attr_fill(id="inst_sh_1", data=zero4)
+            vbo.attr_fill(id="inst_sh_2", data=zero4)
 
         ibo = GPUIndexBuf(type='TRIS', seq=indices)
         return GPUBatch(type='TRIS', buf=vbo, elem=ibo)
@@ -253,66 +270,6 @@ class SplattingState:
             self._batch_cache.pop(('b', block_idx), None)
         self._batch_cache.pop(('fallback', 0), None)
 
-    # ------------------------------------------------------------------
-    # SH coefficient texture (GPU-side SH evaluation)
-    # ------------------------------------------------------------------
-    def _create_sh_texture(self):
-        """Upload raw_dc + SH coefficients to a 2D RGBA32F texture.
-
-        The texture is sampled in the vertex shader for view-dependent SH
-        color evaluation.  One-time upload — coefficients are static.
-        """
-        import gpu
-
-        N = self.point_count
-        if N == 0:
-            return
-
-        # Number of RGB texels per splat: 1 (DC) + n_rest / 3
-        n_rest = 0 if self.sh_coeffs is None else self.sh_coeffs.shape[1]
-        tps = 1 + n_rest // 3
-
-        # 2D texture layout: column = splat_id, row = coeff_index.
-        # GPUs have a max 2D texture width limit; pick a safe width and
-        # pack multiple "blocks" vertically.
-        tex_w = min(N, 16384)
-        blocks = (N + tex_w - 1) // tex_w       # number of horizontal strips
-        tex_h = blocks * tps
-
-        data = np.zeros((tex_h, tex_w, 4), dtype=np.float32)
-
-        # Pack raw_dc at row = block * tps + 0
-        for b in range(blocks):
-            s = b * tex_w
-            e = min(s + tex_w, N)
-            row = b * tps + 0
-            data[row, :e - s, :3] = self.raw_dc[s:e]
-            data[row, :e - s, 3] = 1.0
-
-        # Pack SH coefficients at row = block * tps + 1..tps-1
-        if self.sh_coeffs is not None and n_rest > 0:
-            for j in range(0, n_rest, 3):
-                col_idx = j // 3  # which texel column within this splat
-                for b in range(blocks):
-                    s = b * tex_w
-                    e = min(s + tex_w, N)
-                    row = b * tps + 1 + col_idx
-                    data[row, :e - s, :3] = self.sh_coeffs[s:e, j:j+3]
-                    data[row, :e - s, 3] = 1.0
-
-        # Upload through a temporary Blender Image (reliable data bridge)
-        img = bpy.data.images.new("_sh_tex", tex_w, tex_h,
-                                  float_buffer=True, alpha=True)
-        img.pixels.foreach_set(data.flatten())
-        self.sh_texture = gpu.texture.from_image(img)
-        bpy.data.images.remove(img)
-
-        self.sh_texture_width = tex_w
-        self.sh_texture_tps = tps
-
-        # Free CPU-side coefficient arrays — no longer needed
-        self.raw_dc = None
-        self.sh_coeffs = None
 
 # ---------------------------------------------------------------------------
 # UI property group for the instance list
@@ -861,8 +818,8 @@ def start_render(context):
         inst._orig_model_matrix = np.array(obj.matrix_world, dtype=np.float32)
         inst._orig_model_inv = np.linalg.inv(inst._orig_model_matrix)
 
-        # Upload SH coefficients to GPU texture (frees CPU arrays)
-        inst._create_sh_texture()
+        # SH coefficients stay in CPU arrays for VBO batch building
+        pass
 
         total_points += inst.point_count
         total_blocks += inst.block_count

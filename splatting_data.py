@@ -788,7 +788,7 @@ def start_render(context):
     # Create per-instance state for each mesh
     total_points = 0
     total_blocks = 0
-    _scene.instances.clear()
+    _scene.clear()
 
     for obj in meshes_to_load:
         mesh = obj.data
@@ -872,7 +872,7 @@ def start_render(context):
     from .gpu_renderer import init_renderer
     success = init_renderer()
     if not success:
-        _scene.instances.clear()
+        _scene.clear()
         return
 
     # Find the first 3D view area
@@ -934,9 +934,8 @@ def _emergency_stop():
             pass
         _scene._draw_handle = None
     _scene.is_rendering = False
+    _scene.clear()
     _scene._target_area = None
-    _scene.displayed_block_count = 0
-    _scene.displayed_splat_count = 0
     try:
         from .gpu_renderer import release_renderer
         release_renderer()

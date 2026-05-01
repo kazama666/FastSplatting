@@ -389,6 +389,92 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         _capture_ready = False
 
 
+class SPLATTING_OT_debug_generate(types.Operator):
+    bl_idname = "splatting.debug_generate"
+    bl_label = "Generate Debug Splat"
+    bl_description = "Generate a single-row mesh with debug splat attributes for texture coordinate verification"
+
+    splat_count: bpy.props.IntProperty(
+        default=16, min=2, max=256,
+        description="Number of debug splats to generate",
+    )
+
+    def execute(self, context):
+        import numpy as np
+
+        n = self.splat_count
+
+        # Create mesh: vertices in a row along X, centered at origin
+        mesh = bpy.data.meshes.new("DebugSplats")
+        verts = [(i * 0.5 - (n - 1) * 0.25, 0.0, 0.0) for i in range(n)]
+        mesh.from_pydata(verts, [], [])
+
+        # Add float attributes matching PLY schema
+        for name in ['f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity',
+                      'scale_0', 'scale_1', 'scale_2',
+                      'rot_0', 'rot_1', 'rot_2', 'rot_3']:
+            mesh.attributes.new(name, 'FLOAT', 'POINT')
+
+        # Inverse of: display_color = pow(sigmoid(raw_dc), 2.2)
+        def raw_from_display(r, g, b):
+            eps = 1e-6
+            linear = np.power(np.clip([r, g, b], eps, 1.0 - eps), 1.0 / 2.2)
+            return [float(np.log(c / (1.0 - c))) for c in linear]
+
+        # 8 clearly distinct colors — if sampling is right, pattern is (0,1,2,3,4,5,6,7,0,1,...)
+        palette = [
+            (1.0, 0.0, 0.0),  # 0: Red
+            (0.0, 1.0, 0.0),  # 1: Green
+            (0.0, 0.0, 1.0),  # 2: Blue
+            (1.0, 1.0, 0.0),  # 3: Yellow
+            (0.0, 1.0, 1.0),  # 4: Cyan
+            (1.0, 0.0, 1.0),  # 5: Magenta
+            (1.0, 0.5, 0.0),  # 6: Orange
+            (0.5, 0.0, 1.0),  # 7: Purple
+        ]
+
+        for i in range(n):
+            r, g, b = palette[i % 8]
+            raw = raw_from_display(r, g, b)
+            mesh.attributes["f_dc_0"].data[i].value = raw[0]
+            mesh.attributes["f_dc_1"].data[i].value = raw[1]
+            mesh.attributes["f_dc_2"].data[i].value = raw[2]
+
+            # Opacity: sigmoid → ~0.99
+            mesh.attributes["opacity"].data[i].value = float(np.log(0.99 / 0.01))
+            # Scale: exp → 0.15
+            mesh.attributes["scale_0"].data[i].value = float(np.log(0.15))
+            mesh.attributes["scale_1"].data[i].value = float(np.log(0.15))
+            mesh.attributes["scale_2"].data[i].value = float(np.log(0.15))
+            # Rotation: identity quaternion
+            mesh.attributes["rot_0"].data[i].value = 1.0
+            mesh.attributes["rot_1"].data[i].value = 0.0
+            mesh.attributes["rot_2"].data[i].value = 0.0
+            mesh.attributes["rot_3"].data[i].value = 0.0
+
+        # Create object at 3D cursor, select it
+        obj = bpy.data.objects.new("DebugSplats", mesh)
+        obj.location = context.scene.cursor.location
+        context.collection.objects.link(obj)
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Auto-add to splatting instance list
+        for item in context.scene.splatting_instances:
+            if item.mesh_name == obj.name:
+                self.report({'INFO'}, f"Debug mesh '{obj.name}' already in list")
+                return {'FINISHED'}
+        item = context.scene.splatting_instances.add()
+        item.mesh_name = obj.name
+        item.mesh_uid = obj.session_uid
+        item.enabled = True
+        context.scene.splatting_properties.active_instance_index = len(context.scene.splatting_instances) - 1
+
+        self.report({'INFO'}, f"Generated debug mesh '{obj.name}' with {n} splats")
+        return {'FINISHED'}
+
+
 _operators = [
     SPLATTING_OT_start_render,
     SPLATTING_OT_stop_render,
@@ -398,6 +484,7 @@ _operators = [
     SPLATTING_OT_toggle_instance,
     SPLATTING_OT_sort_blocks,
     SPLATTING_OT_export_animation,
+    SPLATTING_OT_debug_generate,
 ]
 
 

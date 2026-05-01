@@ -25,10 +25,14 @@ class SplattingState:
 
         # Core splatting data
         self.positions = None      # (N, 3) float32
-        self.colors = None         # (N, 3) float32
+        self.raw_dc = None         # (N, 3) float32 — pre-sigmoid SH DC
         self.opacities = None      # (N, 1) float32
         self.scales = None         # (N, 3) float32
         self.rotations = None      # (N, 4) float32 (quaternion)
+
+        # SH higher-degree coefficients
+        self.sh_coeffs = None      # (N, n_rest) float32 or None
+        self.sh_degree = 0         # 0, 1, 2, or 3
 
         # Spatial indexing
         self.block_indices = None
@@ -50,18 +54,33 @@ class SplattingState:
         self._proj_00 = 0.0
         self._proj_11 = 0.0
 
+        # Original block data (frozen at render start for delta-based transform)
+        self._orig_block_centers = None
+        self._orig_block_radii = None
+        self._orig_model_matrix = None
+        self._orig_model_inv = None
+
         # GPU batch cache (per-instance)
         self._batch_cache = {}
+        self.sh_texture = None       # GPUTexture holding raw_dc + SH coefficients
+        self.sh_texture_width = 0    # texture width (for texelFetch coord)
+        self.sh_texture_tps = 0      # texels per splat (1/4/9/16)
+
+        # Pre-computed display color for SH0 fast path (sigmoid + gamma 2.2).
+        # Avoids texelFetch + exp + pow in the vertex shader for DC-only splats.
+        self.display_colors = None   # (N, 3) float32
 
     def clear(self):
         self.target_mesh = None
         self.point_count = 0
         self.block_count = 0
         self.positions = None
-        self.colors = None
+        self.raw_dc = None
         self.opacities = None
         self.scales = None
         self.rotations = None
+        self.sh_coeffs = None
+        self.sh_degree = 0
         self.block_indices = None
         self.block_bounds = None
         self.block_centers = None
@@ -75,6 +94,14 @@ class SplattingState:
         self._proj_00 = 0.0
         self._proj_11 = 0.0
         self._batch_cache = {}
+        self.sh_texture = None
+        self.sh_texture_width = 0
+        self.sh_texture_tps = 0
+        self.display_colors = None
+        self._orig_block_centers = None
+        self._orig_block_radii = None
+        self._orig_model_matrix = None
+        self._orig_model_inv = None
 
     # ------------------------------------------------------------------
     # GPU batch building (moved from gpu_renderer.py)
@@ -122,12 +149,13 @@ class SplattingState:
             return None
 
         positions = self.positions[block_splat_indices]
-        colors = self.colors[block_splat_indices]
         opacities = self.opacities[block_splat_indices]
         scales = self.scales[block_splat_indices]
         rotations = self.rotations[block_splat_indices]
+        colors = self.display_colors[block_splat_indices]
 
-        batch = self._build_billboard_batch_for(positions, colors, opacities, scales, rotations)
+        batch = self._build_billboard_batch_for(
+            positions, opacities, scales, rotations, block_splat_indices, colors)
         self._batch_cache[cache_key] = batch
         return batch
 
@@ -146,30 +174,35 @@ class SplattingState:
             return None
 
         positions = self.positions[fallback_indices]
-        colors = self.colors[fallback_indices]
         opacities = self.opacities[fallback_indices]
         scales = self.scales[fallback_indices]
         rotations = self.rotations[fallback_indices]
+        fallback_ids = np.array(fallback_indices, dtype=np.int32)
 
-        batch = self._build_billboard_batch_for(positions, colors, opacities, scales, rotations)
+        batch = self._build_billboard_batch_for(
+            positions, opacities, scales, rotations, fallback_ids, self.display_colors[fallback_indices])
         self._batch_cache[cache_key] = batch
         return batch
 
-    def _build_billboard_batch_for(self, positions, colors, opacities, scales, rotations):
-        """Build a batch, filtering invisible splats."""
+    def _build_billboard_batch_for(self, positions, opacities, scales, rotations, splat_ids, display_colors):
+        """Build a single-VBO batch. SH0 display color comes from the pre-computed
+        ``display_colors`` vertex attribute (CPU sigmoid+gamma) to avoid texelFetch
+        + exp + pow in the vertex shader.  ``splat_ids`` is used for higher-degree
+        SH texelFetch when tps > 1."""
         N = len(positions)
         if N == 0:
             return None
-        # Filter out low-opacity and tiny splats (view-independent)
+
         opacity_ok = opacities.ravel() >= 0.005
         scale_ok = scales.max(axis=1) >= 0.0003
         mask = opacity_ok & scale_ok
         if not mask.all():
             positions = positions[mask]
-            colors = colors[mask]
             opacities = opacities[mask]
             scales = scales[mask]
             rotations = rotations[mask]
+            splat_ids = splat_ids[mask]
+            display_colors = display_colors[mask]
             N = len(positions)
             if N == 0:
                 return None
@@ -196,14 +229,16 @@ class SplattingState:
         fmt.attr_add(id="inst_opacity", comp_type='F32', len=1, fetch_mode='FLOAT')
         fmt.attr_add(id="inst_cov_a", comp_type='F32', len=3, fetch_mode='FLOAT')
         fmt.attr_add(id="inst_cov_b", comp_type='F32', len=3, fetch_mode='FLOAT')
+        fmt.attr_add(id="inst_splat_id", comp_type='U32', len=1, fetch_mode='INT')
 
         vbo = GPUVertBuf(fmt, len=N * 4)
         vbo.attr_fill(id="quad_coord", data=np.tile(quad_coords, (N, 1)))
         vbo.attr_fill(id="inst_position", data=np.repeat(positions, 4, axis=0))
-        vbo.attr_fill(id="inst_color", data=np.repeat(colors, 4, axis=0))
+        vbo.attr_fill(id="inst_color", data=np.repeat(display_colors, 4, axis=0))
         vbo.attr_fill(id="inst_opacity", data=np.repeat(opacities.ravel(), 4))
         vbo.attr_fill(id="inst_cov_a", data=np.repeat(cov_a, 4, axis=0))
         vbo.attr_fill(id="inst_cov_b", data=np.repeat(cov_b, 4, axis=0))
+        vbo.attr_fill(id="inst_splat_id", data=np.repeat(splat_ids.astype(np.uint32), 4))
 
         ibo = GPUIndexBuf(type='TRIS', seq=indices)
         return GPUBatch(type='TRIS', buf=vbo, elem=ibo)
@@ -218,6 +253,66 @@ class SplattingState:
             self._batch_cache.pop(('b', block_idx), None)
         self._batch_cache.pop(('fallback', 0), None)
 
+    # ------------------------------------------------------------------
+    # SH coefficient texture (GPU-side SH evaluation)
+    # ------------------------------------------------------------------
+    def _create_sh_texture(self):
+        """Upload raw_dc + SH coefficients to a 2D RGBA32F texture.
+
+        The texture is sampled in the vertex shader for view-dependent SH
+        color evaluation.  One-time upload — coefficients are static.
+        """
+        import gpu
+
+        N = self.point_count
+        if N == 0:
+            return
+
+        # Number of RGB texels per splat: 1 (DC) + n_rest / 3
+        n_rest = 0 if self.sh_coeffs is None else self.sh_coeffs.shape[1]
+        tps = 1 + n_rest // 3
+
+        # 2D texture layout: column = splat_id, row = coeff_index.
+        # GPUs have a max 2D texture width limit; pick a safe width and
+        # pack multiple "blocks" vertically.
+        tex_w = min(N, 16384)
+        blocks = (N + tex_w - 1) // tex_w       # number of horizontal strips
+        tex_h = blocks * tps
+
+        data = np.zeros((tex_h, tex_w, 4), dtype=np.float32)
+
+        # Pack raw_dc at row = block * tps + 0
+        for b in range(blocks):
+            s = b * tex_w
+            e = min(s + tex_w, N)
+            row = b * tps + 0
+            data[row, :e - s, :3] = self.raw_dc[s:e]
+            data[row, :e - s, 3] = 1.0
+
+        # Pack SH coefficients at row = block * tps + 1..tps-1
+        if self.sh_coeffs is not None and n_rest > 0:
+            for j in range(0, n_rest, 3):
+                col_idx = j // 3  # which texel column within this splat
+                for b in range(blocks):
+                    s = b * tex_w
+                    e = min(s + tex_w, N)
+                    row = b * tps + 1 + col_idx
+                    data[row, :e - s, :3] = self.sh_coeffs[s:e, j:j+3]
+                    data[row, :e - s, 3] = 1.0
+
+        # Upload through a temporary Blender Image (reliable data bridge)
+        img = bpy.data.images.new("_sh_tex", tex_w, tex_h,
+                                  float_buffer=True, alpha=True)
+        img.pixels.foreach_set(data.flatten())
+        self.sh_texture = gpu.texture.from_image(img)
+        bpy.data.images.remove(img)
+
+        self.sh_texture_width = tex_w
+        self.sh_texture_tps = tps
+
+        # Free CPU-side coefficient arrays — no longer needed
+        self.raw_dc = None
+        self.sh_coeffs = None
 
 # ---------------------------------------------------------------------------
 # UI property group for the instance list
@@ -463,7 +558,12 @@ def unregister():
 # PLY mesh reading
 # ---------------------------------------------------------------------------
 def read_ply_attributes(mesh):
-    """Read Gaussian Splatting attributes from mesh vertex data"""
+    """Read Gaussian Splatting attributes from mesh vertex data.
+
+    Returns (positions, colors, opacities, scales, rotations, raw_dc, sh_coeffs, sh_degree).
+    ``colors`` is the DC-only view-independent color (sigmoid + gamma-encoded).
+    ``raw_dc`` is the pre-sigmoid SH DC coefficient. ``sh_coeffs`` is (N, n_rest) or None.
+    """
     vertex_count = len(mesh.vertices)
 
     positions = np.zeros((vertex_count, 3), dtype=np.float32)
@@ -478,20 +578,42 @@ def read_ply_attributes(mesh):
                 return name
         return None
 
-    # Colors
-    colors = np.zeros((vertex_count, 3), dtype=np.float32)
+    # Raw SH DC coefficients (pre-sigmoid, used for GPU SH evaluation)
+    raw_dc = np.zeros((vertex_count, 3), dtype=np.float32)
     dc0 = find_attr('f_dc_0')
     dc1 = find_attr('f_dc_1')
     dc2 = find_attr('f_dc_2')
     if dc0 and dc1 and dc2:
-        raw_colors = np.zeros((vertex_count, 3), dtype=np.float32)
-        raw_colors[:, 0] = np.array([v.value for v in attributes[dc0].data], dtype=np.float32)
-        raw_colors[:, 1] = np.array([v.value for v in attributes[dc1].data], dtype=np.float32)
-        raw_colors[:, 2] = np.array([v.value for v in attributes[dc2].data], dtype=np.float32)
-        linear = 1.0 / (1.0 + np.exp(-raw_colors))
-        colors = np.power(linear, 2.2)
+        raw_dc[:, 0] = np.array([v.value for v in attributes[dc0].data], dtype=np.float32)
+        raw_dc[:, 1] = np.array([v.value for v in attributes[dc1].data], dtype=np.float32)
+        raw_dc[:, 2] = np.array([v.value for v in attributes[dc2].data], dtype=np.float32)
+
+    # Processed color (sigmoid + gamma) for fallback / backward compat
+    linear = 1.0 / (1.0 + np.exp(-raw_dc))
+    colors = np.power(linear, 2.2)
+
+    # SH higher-degree coefficients (f_rest) — capped at degree 1 (9 coeffs).
+    # Degree 2/3 from input PLY are discarded; these require significantly more
+    # GPU shader work for diminishing visual returns.
+    rest_names = sorted(
+        (name for name in attr_names if name.startswith('f_rest_')),
+        key=lambda n: int(n.split('_')[-1])
+    )
+    if len(rest_names) >= 9:
+        sh_degree = 1
+        n_coeffs = 9
     else:
-        colors[:, :] = [1.0, 1.0, 1.0]
+        sh_degree = 0
+        n_coeffs = 0
+
+    if n_coeffs > 0:
+        sh_coeffs = np.zeros((vertex_count, n_coeffs), dtype=np.float32)
+        for i in range(n_coeffs):
+            sh_coeffs[:, i] = np.array(
+                [v.value for v in attributes[rest_names[i]].data], dtype=np.float32)
+        print(f"[Splatting]  SH degree {sh_degree} ({n_coeffs} coefficients)")
+    else:
+        sh_coeffs = None
 
     # Opacity
     opacities = np.ones((vertex_count, 1), dtype=np.float32) * 0.5
@@ -523,7 +645,7 @@ def read_ply_attributes(mesh):
         rotations[:, 2] = np.array([v.value for v in attributes[rot2].data], dtype=np.float32)
         rotations[:, 3] = np.array([v.value for v in attributes[rot3].data], dtype=np.float32)
 
-    return positions, colors, opacities, scales, rotations
+    return positions, colors, opacities, scales, rotations, raw_dc, sh_coeffs, sh_degree
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +727,8 @@ def build_spatial_index(positions, block_size=1.0, origin_offset=None, use_paral
     }
 
 
+
+
 # ---------------------------------------------------------------------------
 # Draw handler
 # ---------------------------------------------------------------------------
@@ -670,7 +794,7 @@ def start_render(context):
         mesh = obj.data
         print(f"[Splatting] Loading '{obj.name}' ({len(mesh.vertices)} vertices)")
 
-        positions, colors, opacities, scales, rotations = read_ply_attributes(mesh)
+        positions, colors, opacities, scales, rotations, raw_dc, sh_coeffs, sh_degree = read_ply_attributes(mesh)
 
         # Clip low-opacity splats
         clip_val = splatting_props.clip_alpha
@@ -683,6 +807,9 @@ def start_render(context):
                 opacities = opacities[mask]
                 scales = scales[mask]
                 rotations = rotations[mask]
+                raw_dc = raw_dc[mask]
+                if sh_coeffs is not None:
+                    sh_coeffs = sh_coeffs[mask]
                 print(f"[Splatting]  Clipped {len(mask) - kept} splats below alpha {clip_val}")
 
         # Clip small splats by average scale
@@ -696,11 +823,17 @@ def start_render(context):
                 opacities = opacities[mask]
                 scales = scales[mask]
                 rotations = rotations[mask]
+                raw_dc = raw_dc[mask]
+                if sh_coeffs is not None:
+                    sh_coeffs = sh_coeffs[mask]
                 print(f"[Splatting]  Clipped {len(mask) - kept} splats below size {size_val}")
 
         inst = SplattingState()
         inst.positions = positions
-        inst.colors = colors
+        inst.display_colors = colors
+        inst.raw_dc = raw_dc
+        inst.sh_coeffs = sh_coeffs
+        inst.sh_degree = sh_degree
         inst.opacities = opacities
         inst.scales = scales
         inst.rotations = rotations
@@ -721,6 +854,15 @@ def start_render(context):
         inst.block_bounds = spatial['block_bounds']
         inst.block_splat_indices = spatial['block_splat_indices']
         inst.block_count = len(spatial['unique_blocks'])
+
+        # Freeze originals for delta-based transform during rendering
+        inst._orig_block_centers = spatial['block_centers'].copy()
+        inst._orig_block_radii = spatial['block_radii'].copy()
+        inst._orig_model_matrix = np.array(obj.matrix_world, dtype=np.float32)
+        inst._orig_model_inv = np.linalg.inv(inst._orig_model_matrix)
+
+        # Upload SH coefficients to GPU texture (frees CPU arrays)
+        inst._create_sh_texture()
 
         total_points += inst.point_count
         total_blocks += inst.block_count

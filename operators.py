@@ -475,6 +475,113 @@ class SPLATTING_OT_debug_generate(types.Operator):
         return {'FINISHED'}
 
 
+class SPLATTING_OT_import_spz(types.Operator):
+    bl_idname = "import_scene.spz"
+    bl_label = "Import Spark SPZ (.spz)"
+    bl_description = "Import a Niantic Spark SPZ file as a splat instance"
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default='*.spz', options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import numpy as np
+        from .load_spz import load_spz
+
+        spz_path = bpy.path.abspath(self.filepath)
+        if not os.path.isfile(spz_path):
+            self.report({'ERROR'}, f"File not found: {spz_path}")
+            return {'CANCELLED'}
+
+        try:
+            positions, colors, opacities, scales, rotations, raw_dc, sh_coeffs, sh_degree = \
+                load_spz(spz_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to decode SPZ: {e}")
+            return {'CANCELLED'}
+
+        N = len(positions)
+        if N == 0:
+            self.report({'ERROR'}, "No splats found")
+            return {'CANCELLED'}
+
+        name = os.path.splitext(os.path.basename(spz_path))[0]
+        mesh = bpy.data.meshes.new(name)
+        verts = [(float(p[0]), float(p[1]), float(p[2])) for p in positions]
+        mesh.from_pydata(verts, [], [])
+
+        # Build attribute list matching the PLY schema
+        sh_n = sh_coeffs.shape[1] if sh_coeffs is not None else 0
+        attr_list = ['f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity',
+                     'scale_0', 'scale_1', 'scale_2',
+                     'rot_0', 'rot_1', 'rot_2', 'rot_3']
+        if sh_n > 0:
+            attr_list += [f'f_rest_{i}' for i in range(sh_n)]
+        for attr_name in attr_list:
+            mesh.attributes.new(attr_name, 'FLOAT', 'POINT')
+
+        # f_dc (pre-sigmoid SH DC).
+        # SPZ stores display-oriented color centered at 0.5; invert sigmoid
+        # so that read_ply_attributes() → sigmoid(f_dc) recovers the color.
+        eps = 1e-6
+        dc_clip = np.clip(raw_dc, eps, 1.0 - eps)
+        raw_dc_logit = np.log(dc_clip / (1.0 - dc_clip))
+        mesh.attributes['f_dc_0'].data.foreach_set('value', raw_dc_logit[:, 0].astype(np.float32))
+        mesh.attributes['f_dc_1'].data.foreach_set('value', raw_dc_logit[:, 1].astype(np.float32))
+        mesh.attributes['f_dc_2'].data.foreach_set('value', raw_dc_logit[:, 2].astype(np.float32))
+
+        # SH rest (capped at degree 1)
+        if sh_n > 0 and sh_degree >= 1:
+            rest_count = min(sh_n, 9)
+            for i in range(rest_count):
+                mesh.attributes[f'f_rest_{i}'].data.foreach_set(
+                    'value', sh_coeffs[:, i].astype(np.float32))
+
+        # Opacity logit (inverse of sigmoid, matching PLY convention)
+        eps = 1e-6
+        op_clip = np.clip(opacities.ravel(), eps, 1.0 - eps)
+        opacity_logit = np.log(op_clip / (1.0 - op_clip))
+        mesh.attributes['opacity'].data.foreach_set('value', opacity_logit)
+
+        # Scale log (matching PLY convention — mesh stores log(scale))
+        mesh.attributes['scale_0'].data.foreach_set(
+            'value', np.log(np.clip(scales[:, 0], 1e-10, None)).astype(np.float32))
+        mesh.attributes['scale_1'].data.foreach_set(
+            'value', np.log(np.clip(scales[:, 1], 1e-10, None)).astype(np.float32))
+        mesh.attributes['scale_2'].data.foreach_set(
+            'value', np.log(np.clip(scales[:, 2], 1e-10, None)).astype(np.float32))
+
+        # Rotations (quaternion, wxyz)
+        mesh.attributes['rot_0'].data.foreach_set('value', rotations[:, 0])
+        mesh.attributes['rot_1'].data.foreach_set('value', rotations[:, 1])
+        mesh.attributes['rot_2'].data.foreach_set('value', rotations[:, 2])
+        mesh.attributes['rot_3'].data.foreach_set('value', rotations[:, 3])
+
+        obj = bpy.data.objects.new(name, mesh)
+        context.collection.objects.link(obj)
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Add to splatting instance list
+        for item in context.scene.splatting_instances:
+            if item.mesh_name == obj.name:
+                self.report({'INFO'}, f"Imported '{obj.name}' ({N:,} splats)")
+                return {'FINISHED'}
+        item = context.scene.splatting_instances.add()
+        item.mesh_name = obj.name
+        item.mesh_uid = obj.session_uid
+        item.enabled = True
+        context.scene.splatting_properties.active_instance_index = \
+            len(context.scene.splatting_instances) - 1
+
+        self.report({'INFO'}, f"Imported '{obj.name}' ({N:,} splats)")
+        return {'FINISHED'}
+
+
 _operators = [
     SPLATTING_OT_start_render,
     SPLATTING_OT_stop_render,
@@ -485,12 +592,20 @@ _operators = [
     SPLATTING_OT_sort_blocks,
     SPLATTING_OT_export_animation,
     SPLATTING_OT_debug_generate,
+    SPLATTING_OT_import_spz,
 ]
 
 
 def register():
     for op in _operators:
         bpy.utils.register_class(op)
+
+    # File → Import menu
+    def menu_import(self, context):
+        self.layout.operator(
+            SPLATTING_OT_import_spz.bl_idname, text="Spark SPZ (.spz)")
+    bpy.types.TOPBAR_MT_file_import.append(menu_import)
+    SPLATTING_OT_import_spz._menu_import = menu_import
 
 
 def unregister():
@@ -501,3 +616,7 @@ def unregister():
 
     for op in reversed(_operators):
         bpy.utils.unregister_class(op)
+
+    menu_import = getattr(SPLATTING_OT_import_spz, '_menu_import', None)
+    if menu_import:
+        bpy.types.TOPBAR_MT_file_import.remove(menu_import)

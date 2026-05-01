@@ -37,7 +37,7 @@ vec3 computeCov2D(vec4 pos_view, float focal, mat3 cov3d_in, mat3 view_rot) {
 """
 
 _COLOR_ADJUST_SOURCE = """
-    v_opacity = inst_opacity;
+    v_opacity = min(inst_opacity * 2.0, 1.0);
 
     // User color adjustments
     v_color *= u_Tint;
@@ -50,9 +50,9 @@ _COLOR_ADJUST_SOURCE = """
         float lum = dot(v_color, vec3(0.2126, 0.7152, 0.0722));
         v_color = mix(vec3(lum), v_color, u_Saturation);
 
-        v_color *= u_Brightness;
+        v_color *= 1.2*u_Brightness;
 
-        v_color = pow(max(v_color, vec3(0.0)), vec3(1.0 / u_Gamma));
+        v_color = pow(max(v_color, vec3(0.0)), vec3(1.0 / (0.65*u_Gamma)));
     }
 """
 
@@ -60,7 +60,22 @@ _RENDER_SOURCE = """
     vec4 pos_view = u_Matrices.u_ViewMatrix * vec4(inst_position, 1.0);
     vec4 pos_clip = u_Matrices.u_VPMatrix * vec4(inst_position, 1.0);
 
+    // Near clip (behind camera)
     if (pos_view.z >= -0.001) {
+        gl_Position = vec4(-100.0, -100.0, -100.0, 1.0);
+        return;
+    }
+
+    // Far clip — clip-space check handles both near & far automatically
+    if (abs(pos_clip.z) >= pos_clip.w) {
+        gl_Position = vec4(-100.0, -100.0, -100.0, 1.0);
+        return;
+    }
+
+    // XY frustum culling — discard if center is >1.4× frustum bounds
+    // (matching Spark's clipXY = 1.4 default, accounting for wide splats)
+    float clip_margin = 1.4 * pos_clip.w;
+    if (abs(pos_clip.x) > clip_margin || abs(pos_clip.y) > clip_margin) {
         gl_Position = vec4(-100.0, -100.0, -100.0, 1.0);
         return;
     }
@@ -81,11 +96,12 @@ _RENDER_SOURCE = """
     float det_inv = 1.0 / det;
     v_conic = vec3(cov2D.z * det_inv, -cov2D.y * det_inv, cov2D.x * det_inv);
 
-    // Axis-aligned bounding rectangle of the rotated ellipse.
-    // Marginal stddev in x/y gives a tight AABB that never clips the
-    // ellipse, unlike the old formulas (det/c, det/a, or λ-square).
+    // Compute quad half-extent in pixels, clamped to 512 max radius
+    // (matching Spark's maxPixelRadius = 512 default)
     float qx = 3.0 * sqrt(max(cov2D.x, 1e-6));
     float qy = 3.0 * sqrt(max(cov2D.z, 1e-6));
+    qx = min(qx, 512.0);
+    qy = min(qy, 512.0);
 
     vec2 quad_ndc = vec2(qx, qy) / u_ViewportSize * 2.0 * u_QuadScale;
     pos_clip.xyz = pos_clip.xyz / pos_clip.w;

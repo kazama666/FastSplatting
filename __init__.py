@@ -12,11 +12,12 @@ bl_info = {
 # Support hot-reload for development
 if "bpy" in locals():
     import importlib
-    from . import operators, panels, splatting_data, gpu_renderer
+    from . import operators, panels, splatting_data, gpu_renderer, load_spz
     importlib.reload(operators)
     importlib.reload(panels)
     importlib.reload(splatting_data)
     importlib.reload(gpu_renderer)
+    importlib.reload(load_spz)
 else:
     from . import operators
     from . import panels

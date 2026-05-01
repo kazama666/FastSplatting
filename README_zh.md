@@ -3,6 +3,7 @@
 ![banner](assets/banner.png)
 
 高性能 3D 高斯泼溅查看器，内嵌于 Blender 视口中。
+
 支持 Spark's SPZ(.spz) 文件格式 Importer。
 
 ## 功能

@@ -89,6 +89,7 @@ Fast Splatting/
 ## Performance Notes
 
 - Splat count and block size determine memory and draw-call overhead. Larger block size = fewer blocks = fewer draw calls but coarser culling
+- It is recommended to use less than 1.5K blocks.
 - The initial sort after loading or large camera moves may take several frames to converge;
 
 ## License

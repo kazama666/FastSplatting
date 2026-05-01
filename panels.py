@@ -88,11 +88,11 @@ class SPLATTING_PT_panel(types.Panel):
                 settings_body.prop(splatting_props, "clip_alpha", text="Clip Alpha")
                 settings_body.prop(splatting_props, "clip_size", text="Clip Size")
 
-            # Debug section (visible when not rendering)
-            if not splatting_props.is_rendering:
-                settings_body.separator()
-                dbg_row = settings_body.row(align=True)
-                dbg_row.operator("splatting.debug_generate", text="Generate Debug", icon='MESH_GRID')
+            # # Debug section (visible when not rendering)
+            # if not splatting_props.is_rendering:
+            #     settings_body.separator()
+            #     dbg_row = settings_body.row(align=True)
+            #     dbg_row.operator("splatting.debug_generate", text="Generate Debug", icon='MESH_GRID')
 
         # --- Render controls ---
         if not splatting_props.is_rendering:

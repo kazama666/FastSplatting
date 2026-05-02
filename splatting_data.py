@@ -58,6 +58,7 @@ class SplattingState:
         # Original block data (frozen at render start for delta-based transform)
         self._orig_block_centers = None
         self._orig_block_radii = None
+        self._orig_block_bounds = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
         # Frozen world-space AABB at render start (for grid overlay during rendering)
@@ -101,6 +102,7 @@ class SplattingState:
         self.display_colors = None
         self._orig_block_centers = None
         self._orig_block_radii = None
+        self._orig_block_bounds = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
         self._frozen_grid_min = None
@@ -404,6 +406,11 @@ class SplattingProperties(types.PropertyGroup):
         name="Grid Alpha",
         default=0.5, min=0.0, max=1.0,
     )
+    debug_mix: bpy.props.FloatProperty(
+        name="Debug Mix",
+        description="Blend between block-index heatmap and original color. 0 = heatmap, 1 = original.",
+        default=0.7, min=0.0, max=1.0, step=0.01,
+    )
     active_instance_index: bpy.props.IntProperty(default=0,
         description="Active index in the splat instances list")
 
@@ -420,6 +427,19 @@ class SplattingProperties(types.PropertyGroup):
         description="Default saturation for new instances")
     default_quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0,
         description="Default splat scale multiplier for new instances")
+    block_sort_method: bpy.props.EnumProperty(
+        name="Sort Method",
+        description="Block sorting method for alpha blending",
+        default='MIDPOINT',
+        items=[
+            ('MIDPOINT', "区间中点", "Midpoint of nearest and farthest view-space Z"),
+            ('INTERVAL_AWARE', "区间重叠感知", "Nearest Z bin + midpoint tiebreaker for overlapping intervals"),
+            ('AABB_3D_DIST', "AABB三维距离", "3D Euclidean distance to nearest AABB surface point"),
+            ('WEIGHTED_Z', "角点加权Z", "8-corner view-space Z weighted by inverse camera distance"),
+            ('MINZ_AREA', "MinZ+投影面积", "Nearest Z bin + projected area tiebreaker"),
+            ('NEAR_CLIP_SD', "近裁剪面距离", "Signed distance to near clip plane with overlap handling"),
+        ],
+    )
     anim_start_frame: bpy.props.IntProperty(default=1,
         description="First frame of animation export range")
     anim_end_frame: bpy.props.IntProperty(default=250,
@@ -911,6 +931,7 @@ def start_render(context):
         # Freeze originals for delta-based transform during rendering
         inst._orig_block_centers = spatial['block_centers'].copy()
         inst._orig_block_radii = spatial['block_radii'].copy()
+        inst._orig_block_bounds = spatial['block_bounds'].copy()
         inst._orig_model_matrix = np.array(obj.matrix_world, dtype=np.float32)
         inst._orig_model_inv = np.linalg.inv(inst._orig_model_matrix)
 

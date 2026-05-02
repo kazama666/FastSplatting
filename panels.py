@@ -64,6 +64,19 @@ class SPLATTING_PT_panel(types.Panel):
             col.operator("splatting.move_instance", text="", icon='TRIA_UP').direction = 'UP'
             col.operator("splatting.move_instance", text="", icon='TRIA_DOWN').direction = 'DOWN'
 
+            # Light Probe baking
+            idx = splatting_props.active_instance_index
+            if 0 <= idx < len(scene.splatting_instances):
+                item = scene.splatting_instances[idx]
+                obj = bpy.data.objects.get(item.mesh_name)
+                if obj and obj.type == 'MESH':
+                    meshes_body.separator()
+                    has_probes = len(obj.probe_points) > 0
+                    row = meshes_body.row(align=True)
+                    row.operator("splatting.bake_lightprobe", text="Bake Light Probe", icon='LIGHTPROBE_VOLUME')
+                    if has_probes:
+                        row.operator("splatting.remove_lightprobe", text="", icon='X')
+
         layout.separator()
 
         # --- Settings (collapsible, only when not rendering) ---
@@ -79,9 +92,9 @@ class SPLATTING_PT_panel(types.Panel):
             if splatting_props.show_block_grid or not splatting_props.is_rendering: 
                 row = settings_body.row(align=True)
                 row.label(text="Block Offset")
-                row.prop(splatting_props, "block_offset", index=0, text="")
-                row.prop(splatting_props, "block_offset", index=1, text="")
-                row.prop(splatting_props, "block_offset", index=2, text="")
+                row.prop(splatting_props, "block_offset", index=0, text="X")
+                row.prop(splatting_props, "block_offset", index=1, text="Y")
+                row.prop(splatting_props, "block_offset", index=2, text="Z")
 
             if not splatting_props.is_rendering:
                 settings_body.prop(splatting_props, "block_size", text="Block Size")
@@ -123,6 +136,9 @@ class SPLATTING_PT_panel(types.Panel):
                 color_body.prop(item, "color_saturation", text="Saturation", slider=True)
                 color_body.split()
                 color_body.prop(item, "quad_scale", text="Splat Scale", slider=True)
+                row = color_body.split(factor=0.5)
+                row.label(text="")
+                row.operator("splatting.set_default_render", text="Set as Default")
             else:
                 color_body.label(text="Select a mesh from Splat Meshes list", icon='INFO')
 

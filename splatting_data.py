@@ -36,6 +36,7 @@ class SplattingState:
 
         # Spatial indexing
         self.block_indices = None
+        self.grid_dims = None    # (nx, ny, nz) from build_spatial_index
         self.block_bounds = None   # (M, 2, 3) min/max for each block
         self.block_centers = None  # (M, 3) center of each block
         self.block_radii = None    # (M,) bounding sphere radius
@@ -59,6 +60,12 @@ class SplattingState:
         self._orig_block_radii = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
+        # Frozen world-space AABB at render start (for grid overlay during rendering)
+        self._frozen_grid_min = None
+        self._frozen_grid_max = None
+        # Tighter AABB from actual splat positions (for blue wireframe)
+        self._frozen_positions_min = None
+        self._frozen_positions_max = None
 
         # GPU batch cache (per-instance)
         self._batch_cache = {}
@@ -78,6 +85,7 @@ class SplattingState:
         self.sh_coeffs = None
         self.sh_degree = 0
         self.block_indices = None
+        self.grid_dims = None
         self.block_bounds = None
         self.block_centers = None
         self.block_radii = None
@@ -95,6 +103,10 @@ class SplattingState:
         self._orig_block_radii = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
+        self._frozen_grid_min = None
+        self._frozen_grid_max = None
+        self._frozen_positions_min = None
+        self._frozen_positions_max = None
 
     # ------------------------------------------------------------------
     # GPU batch building (moved from gpu_renderer.py)
@@ -306,6 +318,21 @@ class SplattingInstanceItem(types.PropertyGroup):
 
 
 # ---------------------------------------------------------------------------
+# Light Probe data (stored per-object)
+# ---------------------------------------------------------------------------
+class ProbePoint(types.PropertyGroup):
+    """A single light probe point with SH2 coefficients."""
+    location: bpy.props.FloatVectorProperty(size=3, subtype='TRANSLATION',
+        description="World-space position of this probe point")
+    sh_r: bpy.props.FloatVectorProperty(size=9,
+        description="SH2 red channel coefficients (9 bands)")
+    sh_g: bpy.props.FloatVectorProperty(size=9,
+        description="SH2 green channel coefficients (9 bands)")
+    sh_b: bpy.props.FloatVectorProperty(size=9,
+        description="SH2 blue channel coefficients (9 bands)")
+
+
+# ---------------------------------------------------------------------------
 # Scene — container for all instances + global render state
 # ---------------------------------------------------------------------------
 class SplattingScene:
@@ -313,8 +340,8 @@ class SplattingScene:
         self.instances = []          # list of SplattingState (parallel to collection)
         self.is_rendering = False
         self._draw_handle = None
-        self._target_area = None
         self._redraw_timer = None
+        self._preferred_area = None  # the 3D view area that was active at render start
 
         # Aggregated stats (set by renderer each frame)
         self.displayed_block_count = 0
@@ -326,6 +353,7 @@ class SplattingScene:
             inst.clear()
         self.instances.clear()
         self.is_rendering = False
+        self._preferred_area = None
         self.displayed_block_count = 0
         self.displayed_splat_count = 0
 
@@ -346,7 +374,7 @@ class SplattingProperties(types.PropertyGroup):
     point_count: bpy.props.IntProperty(default=0)
     block_count: bpy.props.IntProperty(default=0)
     sort_near_to_far: bpy.props.BoolProperty(default=False)
-    block_size: bpy.props.FloatProperty(default=1.0, min=0.1, max=5.0, step=0.1,
+    block_size: bpy.props.FloatProperty(default=1.0, min=0.1, max=20.0, step=0.1,
         description="Spatial block size for culling. Larger = fewer blocks, fewer draw calls. Requires restart")
     clip_alpha: bpy.props.FloatProperty(
         name="Clip Alpha",
@@ -366,7 +394,7 @@ class SplattingProperties(types.PropertyGroup):
     block_offset: bpy.props.FloatVectorProperty(
         name="Block Offset",
         description="Offset the grid origin to shift block boundaries. Adjustable in real-time.",
-        default=(0.0, 0.0, 0.0), size=3, subtype='TRANSLATION',
+        default=(0.0, 0.0, 0.0), size=3,
     )
     grid_color: bpy.props.FloatVectorProperty(
         name="Grid Color",
@@ -378,6 +406,20 @@ class SplattingProperties(types.PropertyGroup):
     )
     active_instance_index: bpy.props.IntProperty(default=0,
         description="Active index in the splat instances list")
+
+    # Scene-level defaults for per-instance render adjustments
+    default_color_tint: bpy.props.FloatVectorProperty(default=(1.0, 1.0, 1.0), min=0.0, max=2.0,
+        subtype='COLOR', size=3, description="Default color tint for new instances")
+    default_color_brightness: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0, step=0.01,
+        description="Default brightness for new instances")
+    default_color_gamma: bpy.props.FloatProperty(default=1.0, min=0.0, max=5.0, step=0.1,
+        description="Default gamma for new instances")
+    default_color_hue: bpy.props.FloatProperty(default=0.0, min=-1.0, max=1.0, step=0.01,
+        description="Default hue shift for new instances")
+    default_color_saturation: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0, step=0.01,
+        description="Default saturation for new instances")
+    default_quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0,
+        description="Default splat scale multiplier for new instances")
     anim_start_frame: bpy.props.IntProperty(default=1,
         description="First frame of animation export range")
     anim_end_frame: bpy.props.IntProperty(default=250,
@@ -457,8 +499,10 @@ def _on_depsgraph_update(scene, depsgraph):
 def register():
     bpy.utils.register_class(SplattingProperties)
     bpy.utils.register_class(SplattingInstanceItem)
+    bpy.utils.register_class(ProbePoint)
     bpy.types.Scene.splatting_properties = bpy.props.PointerProperty(type=SplattingProperties)
     bpy.types.Scene.splatting_instances = bpy.props.CollectionProperty(type=SplattingInstanceItem)
+    bpy.types.Object.probe_points = bpy.props.CollectionProperty(type=ProbePoint)
 
     # Subscribe to Object name changes
     bpy.msgbus.subscribe_rna(
@@ -506,6 +550,9 @@ def unregister():
     if hasattr(bpy.types.Scene, "splatting_instances"):
         del bpy.types.Scene.splatting_instances
     bpy.utils.unregister_class(SplattingInstanceItem)
+    if hasattr(bpy.types.Object, "probe_points"):
+        del bpy.types.Object.probe_points
+    bpy.utils.unregister_class(ProbePoint)
     if hasattr(bpy.types.Scene, "splatting_properties"):
         del bpy.types.Scene.splatting_properties
     bpy.utils.unregister_class(SplattingProperties)
@@ -687,18 +734,39 @@ def build_spatial_index(positions, block_size=1.0, origin_offset=None, use_paral
 
 
 # ---------------------------------------------------------------------------
-# Draw handler
+# Draw handler — render splats in exactly one 3D view
 # ---------------------------------------------------------------------------
+# We store _preferred_area at render start (the 3D view where the user clicked
+# "Start Render") and only draw when that area's handler fires.  If the
+# preferred area gets freed (new file load) we adopt the first 3D view seen.
 def _draw_handler():
     try:
         context = bpy.context
         area = context.area
-        if area and area.type == 'VIEW_3D' and area == _scene._target_area:
+        if not (area and area.type == 'VIEW_3D'):
+            return
+
+        pref = _scene._preferred_area
+        if pref is not None:
+            try:
+                _ = pref.type
+            except ReferenceError:
+                _scene._preferred_area = None
+                pref = None
+
+        if pref is not None:
+            if area == pref:
+                from .gpu_renderer import draw_splatting
+                draw_splatting(context)
+                area.tag_redraw()
+        else:
+            # No preferred area (freed on new file load) — adopt the first
+            # 3D view encountered so splats stay visible.
+            _scene._preferred_area = area
             from .gpu_renderer import draw_splatting
             draw_splatting(context)
             area.tag_redraw()
     except ReferenceError:
-        # Target area was freed (e.g. new file loaded while rendering)
         _emergency_stop()
 
 
@@ -722,6 +790,15 @@ def start_render(context):
 
     if _scene.is_rendering:
         stop_render(context)
+
+    # Ensure all objects are in Object Mode — custom attribute data access
+    # (read_ply_attributes) returns empty arrays in Edit/Weight Paint mode.
+    raw_mode = bpy.context.mode
+    # Normalize: bpy.context.mode returns 'EDIT_MESH' etc., but
+    # bpy.ops.object.mode_set() expects the short form 'EDIT'.
+    prev_mode = 'EDIT' if raw_mode.startswith('EDIT_') else raw_mode
+    if prev_mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
 
     splatting_props = context.scene.splatting_properties
     block_size = splatting_props.block_size
@@ -802,10 +879,29 @@ def start_render(context):
         ones = np.ones((len(positions), 1), dtype=np.float32)
         positions_h = np.concatenate([positions, ones], axis=1)
         positions_world = (positions_h @ mat.T)[:, :3]
+        # Frozen AABB from bound_box (same source as pre-render grid) so the
+        # grid overlay exactly matches the pre-render view at render start.
+        bbox_local = np.array(obj.bound_box, dtype=np.float32)
+        ones_8 = np.ones((8, 1), dtype=np.float32)
+        corners_h = np.concatenate([bbox_local, ones_8], axis=1)
+        corners_w = (corners_h @ mat.T)[:, :3]
+        inst._frozen_grid_min = corners_w.min(axis=0).copy()
+        inst._frozen_grid_max = corners_w.max(axis=0).copy()
+        inst._frozen_positions_min = positions_world.min(axis=0).copy()
+        inst._frozen_positions_max = positions_world.max(axis=0).copy()
         offset = splatting_props.block_offset
+        # Adjust block offset so blocks share the same spatial origin as the
+        # grid (which is based on bound_box AABB).  Without this the block
+        # division and grid lines drift apart under rotation since
+        # positions_world.min ≠ (bound_box @ mat.T).min.
+        grid_ref = corners_w.min(axis=0)  # bound_box world AABB min
+        pos_ref = positions_world.min(axis=0)
+        offset_arr = np.array(offset, dtype=np.float32)
+        adjusted = grid_ref + offset_arr - pos_ref
         spatial = build_spatial_index(positions_world, block_size=block_size,
-                                      origin_offset=offset if any(offset) else None, use_parallel=True)
+                                      origin_offset=adjusted, use_parallel=True)
         inst.block_indices = spatial['block_indices']
+        inst.grid_dims = spatial['grid_dims']
         inst.block_centers = spatial['block_centers']
         inst.block_radii = spatial['block_radii']
         inst.block_bounds = spatial['block_bounds']
@@ -825,6 +921,10 @@ def start_render(context):
         total_blocks += inst.block_count
         _scene.instances.append(inst)
 
+    # Restore the mode that was active before we forced OBJECT mode
+    if prev_mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode=prev_mode)
+
     # Initialize GPU renderer (shared shader)
     from .gpu_renderer import init_renderer
     success = init_renderer()
@@ -832,14 +932,8 @@ def start_render(context):
         _scene.clear()
         return
 
-    # Find the first 3D view area
-    _scene._target_area = None
-    for area in context.screen.areas:
-        if area.type == 'VIEW_3D':
-            _scene._target_area = area
-            break
-
-    # Register draw handler
+    # Register draw handler, remembering which 3D view area was active
+    _scene._preferred_area = context.area
     _scene._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
         _draw_handler, (), 'WINDOW', 'POST_VIEW'
     )
@@ -892,7 +986,6 @@ def _emergency_stop():
         _scene._draw_handle = None
     _scene.is_rendering = False
     _scene.clear()
-    _scene._target_area = None
     try:
         from .gpu_renderer import release_renderer
         release_renderer()
@@ -986,7 +1079,7 @@ def sort_next_batch(inst, context):
 
     _start_redraw_timer()
 
-    SORT_BUDGET_MS = 5.0
+    SORT_BUDGET_MS = 3.0
     block_range = np.arange(inst.sorted_up_to, inst.block_count, dtype=np.intp)
 
     # Prioritise visible blocks via vectorised frustum test
@@ -1022,7 +1115,16 @@ def sort_next_batch(inst, context):
 
     if inst.sorted_up_to >= inst.block_count:
         inst._sort_active = False
-        _try_stop_redraw_timer()
+
+
+def _find_first_3dview():
+    """Return the first VIEW_3D area across all windows, or None."""
+    for wm in bpy.data.window_managers:
+        for win in wm.windows:
+            for a in win.screen.areas:
+                if a.type == 'VIEW_3D':
+                    return a
+    return None
 
 
 def _start_redraw_timer():
@@ -1057,27 +1159,35 @@ def _redraw_tick():
         _scene._redraw_timer = None
         return None
 
-    # Check that the target area is still valid (survives new-file load)
-    if _scene._target_area is not None:
+    # If the preferred area is no longer among any visible 3D view
+    # (e.g. user maximized a different window), reassign to the first one.
+    if _scene._preferred_area is not None:
         try:
-            _ = _scene._target_area.type
+            _ = _scene._preferred_area.type
         except ReferenceError:
-            _emergency_stop()
-            _scene._redraw_timer = None
-            return None
+            _scene._preferred_area = None
+
+        if _scene._preferred_area is not None:
+            found = any(
+                a == _scene._preferred_area
+                for wm in bpy.data.window_managers
+                for win in wm.windows
+                for a in win.screen.areas
+                if a.type == 'VIEW_3D'
+            )
+            if not found:
+                _scene._preferred_area = _find_first_3dview()
+
+    if _scene._preferred_area is None:
+        _scene._preferred_area = _find_first_3dview()
 
     # Check if any instance still needs sorting
-    any_active = False
     for inst in _scene.instances:
         if inst._sort_active and inst.sorted_up_to < inst.block_count:
-            any_active = True
-            break
-    if not any_active:
-        _scene._redraw_timer = None
-        return None
-    for wm in bpy.data.window_managers:
-        for win in wm.windows:
-            for area in win.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    return 1.0 / 24.0
+            for wm in bpy.data.window_managers:
+                for win in wm.windows:
+                    for area in win.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            area.tag_redraw()
+            return 1.0 / 24.0
+    return 1.0  # keep running at low freq for window-change detection

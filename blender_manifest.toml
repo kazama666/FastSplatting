@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "fast_splatting"
-version = "0.8.0"
+version = "0.8.1"
 name = "Fast Splatting"
 tagline = "High-performance 3D Gaussian Splatting viewer embedded in Blender's viewport"
 maintainer = "Kazama666"

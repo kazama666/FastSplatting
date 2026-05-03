@@ -369,6 +369,191 @@ def get_state():
 
 
 # ---------------------------------------------------------------------------
+# Irradiance probe interpolation (PRE_VIEW draw handler)
+# ---------------------------------------------------------------------------
+_irradiance_objects = []        # object names with "irradiance_from_splats" modifier
+_irradiance_update_idx = 0      # round-robin counter
+_irradiance_pre_handle = None   # PRE_VIEW draw handler handle
+_probe_cache_valid = False
+_probe_cache_grids = None   # list of dicts, one per instance with probe grid data
+
+
+def _extract_grid(probes):
+    """From a probe_points collection, reconstruct grid metadata + SH data."""
+    positions = np.array([list(p.location) for p in probes], dtype=np.float32)
+    sh_r = np.array([list(p.sh_r) for p in probes], dtype=np.float32)
+    sh_g = np.array([list(p.sh_g) for p in probes], dtype=np.float32)
+    sh_b = np.array([list(p.sh_b) for p in probes], dtype=np.float32)
+
+    # Deduce grid dimensions from unique coordinates
+    xs = np.unique(np.round(positions[:, 0], decimals=5))
+    ys = np.unique(np.round(positions[:, 1], decimals=5))
+    zs = np.unique(np.round(positions[:, 2], decimals=5))
+
+    ni, nj, nk = len(xs), len(ys), len(zs)
+    if ni < 2 or nj < 2 or nk < 2:
+        return None
+
+    bs = xs[1] - xs[0]
+    origin = np.array([xs[0] - bs, ys[0] - bs, zs[0] - bs])
+    return {
+        'origin': origin,
+        'block_size': bs,
+        'ni': ni, 'nj': nj, 'nk': nk,     # interior count
+        'positions': positions,
+        'sh_r': sh_r, 'sh_g': sh_g, 'sh_b': sh_b,
+    }
+
+
+def _trilinear(grid, pos):
+    """Trilinearly interpolate SH2 coefficients at world-space pos from a probe grid.
+
+    Returns 9 RGB tuples (never None — clamps to nearest valid cell).
+    """
+    o = grid['origin']
+    bs = grid['block_size']
+    ni, nj, nk = grid['ni'], grid['nj'], grid['nk']
+
+    # Full-grid coordinate
+    gx = (pos[0] - o[0]) / bs
+    gy = (pos[1] - o[1]) / bs
+    gz = (pos[2] - o[2]) / bs
+
+    # Clamp to nearest valid cell. Interior probes span full-grid indices [1, ni].
+    # A cell's left corner must be in [1, ni-1] so the right corner is ≤ ni.
+    ix = int(np.floor(np.clip(gx, 1, ni - 1)))
+    iy = int(np.floor(np.clip(gy, 1, nj - 1)))
+    iz = int(np.floor(np.clip(gz, 1, nk - 1)))
+
+    tx = min(max(gx - ix, 0.0), 1.0)
+    ty = min(max(gy - iy, 0.0), 1.0)
+    tz = min(max(gz - iz, 0.0), 1.0)
+
+    # 8 corner interior-flat indices
+    def _flat(i, j, k):
+        return (i - 1) * nj * nk + (j - 1) * nk + (k - 1)
+
+    c = [[ix, iy, iz], [ix + 1, iy, iz],
+         [ix, iy + 1, iz], [ix + 1, iy + 1, iz],
+         [ix, iy, iz + 1], [ix + 1, iy, iz + 1],
+         [ix, iy + 1, iz + 1], [ix + 1, iy + 1, iz + 1]]
+
+    w = [(1 - tx) * (1 - ty) * (1 - tz),
+         tx * (1 - ty) * (1 - tz),
+         (1 - tx) * ty * (1 - tz),
+         tx * ty * (1 - tz),
+         (1 - tx) * (1 - ty) * tz,
+         tx * (1 - ty) * tz,
+         (1 - tx) * ty * tz,
+         tx * ty * tz]
+
+    sh_r = np.zeros(9, dtype=np.float32)
+    sh_g = np.zeros(9, dtype=np.float32)
+    sh_b = np.zeros(9, dtype=np.float32)
+    for k in range(8):
+        idx = _flat(*c[k])
+        sh_r += grid['sh_r'][idx] * w[k]
+        sh_g += grid['sh_g'][idx] * w[k]
+        sh_b += grid['sh_b'][idx] * w[k]
+
+    return [(float(sh_r[b]), float(sh_g[b]), float(sh_b[b])) for b in range(9)]
+
+
+def _refresh_probe_cache():
+    """Rebuild per-instance probe grid cache."""
+    global _probe_cache_grids, _probe_cache_valid
+    _probe_cache_grids = []
+    for inst in _scene.instances:
+        if inst.target_mesh and hasattr(inst.target_mesh, 'probe_points'):
+            probes = inst.target_mesh.probe_points
+            if len(probes) > 0:
+                g = _extract_grid(probes)
+                if g is not None:
+                    _probe_cache_grids.append(g)
+    _probe_cache_valid = True
+
+
+def collect_irradiance_objects():
+    """Scan scene for meshes with a geometry node named 'irradiance_from_splats'."""
+    global _irradiance_objects
+    _irradiance_objects = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != 'MESH':
+            continue
+        for mod in obj.modifiers:
+            if mod.type == 'NODES' and mod.node_group and "irradiance_from_splats" in mod.node_group.name:
+                _irradiance_objects.append(obj.name)
+                break
+
+
+def _irradiance_pre_draw():
+    """PRE_VIEW handler: for one irradiance receiver object per frame,
+    trilinearly interpolate probe SH coefficients and write to its geometry node modifier."""
+    if not _scene.is_rendering:
+        return
+
+    collect_irradiance_objects()
+    if not _irradiance_objects:
+        return
+
+    if not _probe_cache_valid:
+        _refresh_probe_cache()
+    if not _probe_cache_grids:
+        return
+
+    # Round-robin: update one object per frame
+    global _irradiance_update_idx
+    idx = _irradiance_update_idx % len(_irradiance_objects)
+    _irradiance_update_idx += 1
+
+    obj_name = _irradiance_objects[idx]
+    obj = bpy.data.objects.get(obj_name)
+    if not obj or obj.type != 'MESH':
+        return
+
+    # Find the modifier (still present?)
+    target_mod = None
+    for mod in obj.modifiers:
+        if mod.type == 'NODES' and mod.node_group and "irradiance_from_splats" in mod.node_group.name:
+            target_mod = mod
+            break
+    if not target_mod:
+        return
+
+    center = np.array(obj.matrix_world.translation, dtype=np.float32)
+
+    # Use the first probe grid (trilinear always succeeds with clamping).
+    g = _probe_cache_grids[0]
+    bands = _trilinear(g, center)
+
+    # Write 9 Color inputs (SH_Band_0 … SH_Band_8) to the modifier
+    try:
+        # Map display names → socket identifiers from the node group interface
+        socket_ids = {}
+        if target_mod.node_group:
+            for item in target_mod.node_group.interface.items_tree:
+                if item.item_type == 'SOCKET' and item.in_out == 'INPUT':
+                    socket_ids[item.name] = item.identifier
+        for bi in range(9):
+            name = f"SH_Band_{bi}"
+            key = socket_ids.get(name, name)
+            v = bands[bi]
+            try:
+                arr = target_mod[key]
+                arr[0] = float(v[0])
+                arr[1] = float(v[1])
+                arr[2] = float(v[2])
+            except (KeyError, TypeError):
+                target_mod[key] = [float(v[0]), float(v[1]), float(v[2])]
+    except Exception as e:
+        print(f"[Splatting] Irradiance write failed for '{obj_name}': {e}")
+        return
+
+    # Tag object for update so geometry node re-evaluates next frame
+    obj.update_tag()
+
+
+# ---------------------------------------------------------------------------
 # Properties
 # ---------------------------------------------------------------------------
 class SplattingProperties(types.PropertyGroup):
@@ -406,11 +591,6 @@ class SplattingProperties(types.PropertyGroup):
         name="Grid Alpha",
         default=0.5, min=0.0, max=1.0,
     )
-    debug_mix: bpy.props.FloatProperty(
-        name="Debug Mix",
-        description="Blend between block-index heatmap and original color. 0 = heatmap, 1 = original.",
-        default=0.7, min=0.0, max=1.0, step=0.01,
-    )
     active_instance_index: bpy.props.IntProperty(default=0,
         description="Active index in the splat instances list")
 
@@ -427,18 +607,15 @@ class SplattingProperties(types.PropertyGroup):
         description="Default saturation for new instances")
     default_quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0,
         description="Default splat scale multiplier for new instances")
-    block_sort_method: bpy.props.EnumProperty(
-        name="Sort Method",
-        description="Block sorting method for alpha blending",
-        default='MIDPOINT',
-        items=[
-            ('MIDPOINT', "区间中点", "Midpoint of nearest and farthest view-space Z"),
-            ('INTERVAL_AWARE', "区间重叠感知", "Nearest Z bin + midpoint tiebreaker for overlapping intervals"),
-            ('AABB_3D_DIST', "AABB三维距离", "3D Euclidean distance to nearest AABB surface point"),
-            ('WEIGHTED_Z', "角点加权Z", "8-corner view-space Z weighted by inverse camera distance"),
-            ('MINZ_AREA', "MinZ+投影面积", "Nearest Z bin + projected area tiebreaker"),
-            ('NEAR_CLIP_SD', "近裁剪面距离", "Signed distance to near clip plane with overlap handling"),
-        ],
+    bake_gain: bpy.props.FloatProperty(
+        name="Bake Gain",
+        description="Expand splat color range before baking probes. Higher values = more dynamic range in indirect lighting.",
+        default=3.0, min=1.0, max=10.0, step=0.1,
+    )
+    bake_gain_start: bpy.props.FloatProperty(
+        name="Bake Gain Start",
+        description="Threshold where non-linear expansion begins. Colors below this stay nearly unchanged.",
+        default=0.7, min=0.5, max=0.95, step=0.01,
     )
     anim_start_frame: bpy.props.IntProperty(default=1,
         description="First frame of animation export range")
@@ -448,6 +625,11 @@ class SplattingProperties(types.PropertyGroup):
         description="Directory to save exported frames")
     anim_force_sort: bpy.props.BoolProperty(default=True,
         description="Sort blocks far-to-near every frame when camera changes")
+    default_irradiance_color: bpy.props.FloatVectorProperty(
+        name="Default Irradiance",
+        description="Default ambient color for receivers with no nearby probes",
+        default=(0.2, 0.2, 0.2), subtype='COLOR', min=0, max=1, size=3,
+    )
     ui_export_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle export animation section")
     ui_color_expanded: bpy.props.BoolProperty(default=True,
@@ -552,6 +734,7 @@ def unregister():
         except Exception:
             pass
         _scene._draw_handle = None
+    _unregister_irradiance_pre_draw()
     try:
         from .gpu_renderer import release_renderer
         release_renderer()
@@ -967,6 +1150,27 @@ def start_render(context):
 
     _tag_view3d_redraw()
 
+    # --- Irradiance probe interpolation setup ---
+    collect_irradiance_objects()
+    _refresh_probe_cache()
+    global _irradiance_pre_handle, _irradiance_update_idx
+    _irradiance_update_idx = 0
+    if _irradiance_pre_handle is None:
+        _irradiance_pre_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _irradiance_pre_draw, (), 'WINDOW', 'PRE_VIEW'
+        )
+
+
+def _unregister_irradiance_pre_draw():
+    """Remove the PRE_VIEW irradiance draw handler if registered."""
+    global _irradiance_pre_handle
+    if _irradiance_pre_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_irradiance_pre_handle, 'WINDOW')
+        except Exception:
+            pass
+        _irradiance_pre_handle = None
+
 
 def stop_render(context):
     """Stop rendering and clear all splatting data."""
@@ -974,13 +1178,16 @@ def stop_render(context):
 
     _stop_redraw_timer()
 
-    # Unregister draw handler
+    # Unregister POST_VIEW draw handler
     if _scene._draw_handle is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_scene._draw_handle, 'WINDOW')
         except Exception:
             pass
         _scene._draw_handle = None
+
+    # Unregister PRE_VIEW irradiance handler
+    _unregister_irradiance_pre_draw()
 
     # Release GPU resources
     from .gpu_renderer import release_renderer
@@ -1005,6 +1212,7 @@ def _emergency_stop():
         except Exception:
             pass
         _scene._draw_handle = None
+    _unregister_irradiance_pre_draw()
     _scene.is_rendering = False
     _scene.clear()
     try:

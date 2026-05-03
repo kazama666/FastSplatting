@@ -715,66 +715,160 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         C2b = 0.31539156525252005  # 1/4 * sqrt(5/pi)
         C2c = 0.5462742152960396   # 1/4 * sqrt(15/pi)
 
-        # Per-splat effective radius for Gaussian falloff
-        eff_radii = np.maximum(scales.mean(axis=1), 0.001)
-        has_sh = (sh_coeffs is not None and sh_degree >= 1 and sh_coeffs.shape[1] >= 9)
+        flat_dc = 1.0 / (1.0 + np.exp(-raw_dc))  # (N, 3) linear color
+
+        # ------------------------------------------------------------------
+        # Block-based filtering: subdivide each block into 3×3×3 sub-blocks
+        # and keep 1 brightest + 1 largest per sub-block. This ensures
+        # selected splats are spatially distributed within each block.
+        # ------------------------------------------------------------------
+        SUBDIV = 3  # sub-blocks per axis
+        ncx = max(1, nx - 1)
+        ncy = max(1, ny - 1)
+        ncz = max(1, nz - 1)
+        num_blocks = ncx * ncy * ncz
+
+        brightness = flat_dc.max(axis=1)
+        splat_size = scales.max(axis=1)
+
+        if num_blocks > 0 and N > 2 * SUBDIV**3 * num_blocks:
+            bs = block_size
+            bix = np.floor((positions_world[:, 0] - origin[0]) / bs).astype(np.int32)
+            biy = np.floor((positions_world[:, 1] - origin[1]) / bs).astype(np.int32)
+            biz = np.floor((positions_world[:, 2] - origin[2]) / bs).astype(np.int32)
+            bix = np.clip(bix, 0, ncx - 1)
+            biy = np.clip(biy, 0, ncy - 1)
+            biz = np.clip(biz, 0, ncz - 1)
+            block_key = bix * (ncy * ncz) + biy * ncz + biz
+
+            # Sub-block index within each block
+            local_x = (positions_world[:, 0] - origin[0]) / bs - bix
+            local_y = (positions_world[:, 1] - origin[1]) / bs - biy
+            local_z = (positions_world[:, 2] - origin[2]) / bs - biz
+            sub_ix = np.floor(local_x * SUBDIV).astype(np.int32)
+            sub_iy = np.floor(local_y * SUBDIV).astype(np.int32)
+            sub_iz = np.floor(local_z * SUBDIV).astype(np.int32)
+            sub_ix = np.clip(sub_ix, 0, SUBDIV - 1)
+            sub_iy = np.clip(sub_iy, 0, SUBDIV - 1)
+            sub_iz = np.clip(sub_iz, 0, SUBDIV - 1)
+            sub_key = sub_ix * SUBDIV * SUBDIV + sub_iy * SUBDIV + sub_iz
+            combined_key = block_key * SUBDIV**3 + sub_key
+
+            selected = np.zeros(N, dtype=bool)
+            selected_bright = np.zeros(N, dtype=bool)
+            for ck in np.unique(combined_key):
+                mask = combined_key == ck
+                indices = np.where(mask)[0]
+                # 1 brightest
+                top_b = indices[np.argmax(brightness[indices])]
+                selected[top_b] = True
+                selected_bright[top_b] = True
+                # 1 largest (may be same as brightest, dedup via set True)
+                top_l = indices[np.argmax(splat_size[indices])]
+                selected[top_l] = True
+
+            filtered_positions = positions_world[selected]
+            filtered_colors = flat_dc[selected]
+            M = len(filtered_positions)
+            # block_avg from brightest splats only (ignore "largest" picks)
+            block_avg = flat_dc[selected_bright].mean(axis=0)
+            print(f"[Splatting Bake] block_avg (bright only) = R={block_avg[0]:.4f}  G={block_avg[1]:.4f}  B={block_avg[2]:.4f}")
+        else:
+            filtered_positions = positions_world
+            filtered_colors = flat_dc
+            M = N
+            block_avg = filtered_colors.mean(axis=0)
+            print(f"[Splatting Bake] block_avg (all splats) = R={block_avg[0]:.4f}  G={block_avg[1]:.4f}  B={block_avg[2]:.4f}")
+
+        # Use block_avg as the default irradiance fallback for receivers outside grids
+        bpy.context.scene.splatting_properties.default_irradiance_color = (
+            float(np.clip(block_avg[0], 0, 1)),
+            float(np.clip(block_avg[1], 0, 1)),
+            float(np.clip(block_avg[2], 0, 1)),
+        )
+
+        # ------------------------------------------------------------------
+        # Precompute 64 uniform sphere directions (Fibonacci spiral)
+        # for directional nearest-splat search.
+        # ------------------------------------------------------------------
+        NUM_DIR_SAMPLES = 64
+        golden_angle = np.pi * (3 - np.sqrt(5))
+        i = np.arange(NUM_DIR_SAMPLES, dtype=np.float64)
+        theta = golden_angle * i
+        z = np.linspace(1 - 1/NUM_DIR_SAMPLES, 1/NUM_DIR_SAMPLES - 1, NUM_DIR_SAMPLES)
+        r = np.sqrt(1 - z*z)
+        sample_dirs = np.column_stack([r * np.cos(theta), r * np.sin(theta), z]).astype(np.float32)
+
+        sx, sy, sz = sample_dirs[:, 0], sample_dirs[:, 1], sample_dirs[:, 2]
+        sx2, sy2, sz2 = sx*sx, sy*sy, sz*sz
+        sample_basis = np.column_stack([
+            np.full(NUM_DIR_SAMPLES, C0),
+            C1 * sy, C1 * sz, C1 * sx,
+            C2a * sx * sy, C2a * sy * sz,
+            C2b * (3.0*sz2 - 1.0),
+            C2a * sx * sz,
+            C2c * (sx2 - sy2),
+        ]).astype(np.float32)
 
         context.window_manager.progress_begin(0, num_probes)
         num_stored = 0
+        gain = props.bake_gain
 
         for pi in range(num_probes):
             if pi % 5 == 0 or pi == num_probes - 1:
                 context.window_manager.progress_update(pi)
 
             pp = probe_positions[pi]
+            dv = filtered_positions - pp
+            dists = np.linalg.norm(dv, axis=1)
+            ndirs = dv / (dists[:, None] + 1e-8)
+            ncolors = filtered_colors
 
-            # Direction from probe to each splat
-            dirs = positions_world - pp
-            dists = np.linalg.norm(dirs, axis=1)
+            # Batched matmul: nearest splat per direction
+            M_local = len(ndirs)
+            BATCH = 200000
+            cos_sim = np.empty((M_local, NUM_DIR_SAMPLES), dtype=np.float32)
+            for start in range(0, M_local, BATCH):
+                end = min(start + BATCH, M_local)
+                cos_sim[start:end] = ndirs[start:end] @ sample_dirs.T
+            nearest_idx = np.argmax(cos_sim, axis=0).astype(np.intp)
+            max_cos = cos_sim[nearest_idx, np.arange(NUM_DIR_SAMPLES)]
 
-            # Distance hard threshold: skip if nearest splat is > 1.5 blocks away
-            if dists.min() > block_size * 1.5:
-                continue
+            sample_colors = ncolors[nearest_idx]
 
-            dirs /= dists[:, None] + 1e-8
+            # Combined weight: angular confidence × distance-saturation.
+            # Good match + close → use splat color.
+            # Poor match or far → blend to block average.
+            angular_weight = np.clip((max_cos - 0.3) / 0.5, 0, 1)
+            sample_dists = dists[nearest_idx]
+            sat = sample_colors.max(axis=1) - sample_colors.min(axis=1)
+            dist_weight = 1.0 / (1.0 + sat * (sample_dists / block_size) ** 2)
+            w = (angular_weight * dist_weight)[:, None]
+            sample_colors = sample_colors * w + block_avg[None, :] * (1.0 - w)
 
-            # Gaussian weight: opacity * exp(-0.5 * (dist/radius)^2)
-            weights = opacities.ravel() * np.exp(-0.5 * (dists / eff_radii)**2)
+            # DEBUG: first probe stats
+            if pi == 0:
+                print(f"[Splatting Bake] Probe 0: colors min={sample_colors.min():.4f} max={sample_colors.max():.4f} "
+                      f"mean={sample_colors.mean():.4f}  w min={w.min():.4f} max={w.max():.4f} "
+                      f"angular min={angular_weight.min():.4f} dist min={dist_weight.min():.4f}")
 
-            x, y, z = dirs[:, 0], dirs[:, 1], dirs[:, 2]
+            # Inverse tone mapping
+            gs = props.bake_gain_start
+            t = np.clip((sample_colors - gs) / (1.0 - gs), 0, 1)
+            sample_colors *= (1.0 + t * t * (gain - 1.0))
 
-            # Evaluate splat SH color at direction from probe
-            if has_sh:
-                rest = sh_coeffs[:, :9]
-                result = raw_dc.copy()
-                result[:, 0] += rest[:, 0]*(-C1*y) + rest[:, 3]*(C1*z) + rest[:, 6]*(-C1*x)
-                result[:, 1] += rest[:, 1]*(-C1*y) + rest[:, 4]*(C1*z) + rest[:, 7]*(-C1*x)
-                result[:, 2] += rest[:, 2]*(-C1*y) + rest[:, 5]*(C1*z) + rest[:, 8]*(-C1*x)
-            else:
-                result = raw_dc.copy()
+            # SH2 projection with uniform directional sampling
+            uniform_scale = 4.0 * np.pi / NUM_DIR_SAMPLES
+            sh_r = (sample_colors[:, 0:1] * sample_basis).sum(axis=0) * uniform_scale
+            sh_g = (sample_colors[:, 1:2] * sample_basis).sum(axis=0) * uniform_scale
+            sh_b = (sample_colors[:, 2:3] * sample_basis).sum(axis=0) * uniform_scale
 
-            # Sigmoid → linear color
-            splat_colors = 1.0 / (1.0 + np.exp(-result))
-
-            # SH2 basis functions
-            x2, y2, z2 = x*x, y*y, z*z
-            basis = np.column_stack([
-                np.full_like(x, C0),        # l=0,m=0
-                C1 * y,                      # l=1,m=-1
-                C1 * z,                      # l=1,m=0
-                C1 * x,                      # l=1,m=1
-                C2a * x * y,                 # l=2,m=-2
-                C2a * y * z,                 # l=2,m=-1
-                C2b * (3.0*z2 - 1.0),        # l=2,m=0
-                C2a * x * z,                 # l=2,m=1
-                C2c * (x2 - y2),             # l=2,m=2
-            ])
-
-            # Monte Carlo SH2 projection: c_lm = 4π * Σ(c * Y_lm * w) / Σ(w)
-            scale = 4.0 * np.pi / weights.sum()
-            sh_r = (splat_colors[:, 0:1] * weights[:, None] * basis).sum(axis=0) * scale
-            sh_g = (splat_colors[:, 1:2] * weights[:, None] * basis).sum(axis=0) * scale
-            sh_b = (splat_colors[:, 2:3] * weights[:, None] * basis).sum(axis=0) * scale
+            # Pre-convolution window: scale down higher bands to prevent
+            # negative-ringing artifacts in irradiance reconstruction.
+            window = np.array([1.0, 0.75, 0.75, 0.75, 0.5, 0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+            sh_r *= window
+            sh_g *= window
+            sh_b *= window
 
             pt = obj.probe_points.add()
             pt.location = (float(pp[0]), float(pp[1]), float(pp[2]))
@@ -784,6 +878,9 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
             num_stored += 1
 
         context.window_manager.progress_end()
+        # Invalidate probe cache so runtime picks up the new bake immediately
+        from . import splatting_data
+        splatting_data._probe_cache_valid = False
         self.report({'INFO'}, f"Baked {num_stored} light probes on '{obj.name}'")
         return {'FINISHED'}
 

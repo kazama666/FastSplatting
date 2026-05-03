@@ -53,7 +53,6 @@ _COLOR_ADJUST_SOURCE = """
         v_color *= 1.2*u_Brightness;
 
         v_color = pow(max(v_color, vec3(0.0)), vec3(1.0 / (0.65*u_Gamma)));
-        v_color = mix(vec3(u_BlockIdx), v_color, u_DebugMix);
     }
 """
 
@@ -256,8 +255,6 @@ def _build_shader(vert_out, with_sh, ortho=False):
     info.push_constant('FLOAT', "u_Saturation")
     info.push_constant('FLOAT', "u_Brightness")
     info.push_constant('VEC3', "u_Tint")
-    info.push_constant('FLOAT', "u_BlockIdx")
-    info.push_constant('FLOAT', "u_DebugMix")
 
     if with_sh:
         info.push_constant('VEC3', "u_CameraPos")
@@ -357,7 +354,6 @@ class SplattingRenderer:
         shader.uniform_float("u_Brightness", data['ui'].color_brightness)
         shader.uniform_float("u_Tint", data['ui'].color_tint)
 
-        shader.uniform_float("u_DebugMix", data['debug_mix'])
         self._update_matrices_ubo(data['vp'], data['view'])
         shader.uniform_block('u_Matrices', self._matrices_ubo)
 
@@ -507,85 +503,17 @@ class SplattingRenderer:
                     inst.sorted_up_to = 0
             sort_next_batch(inst, context)
 
-            # ------------------------------------------------------------------
-            # Block ordering: dispatch by selected sort method
-            # ------------------------------------------------------------------
-            sort_method = splatting_props.block_sort_method
+            # Block ordering: midpoint of nearest and farthest view-space Z
+            view_np = np.asarray(view_matrix, dtype=np.float32)
+            vz = view_np[2:3, :3]
             lo = inst.block_bounds[:, 0, :]
             hi = inst.block_bounds[:, 1, :]
-
-            # Common computation: view-space Z rows (needed by most methods)
-            if sort_method in ('MIDPOINT', 'INTERVAL_AWARE', 'MINZ_AREA', 'NEAR_CLIP_SD'):
-                view_np = np.asarray(view_matrix, dtype=np.float32)
-                vz = view_np[2:3, :3]
-                near_pick = np.where(vz > 0, hi, lo)
-                far_pick = np.where(vz > 0, lo, hi)
-                near_end = -((near_pick * vz).sum(axis=1) + view_np[2, 3])
-                far_end = -((far_pick * vz).sum(axis=1) + view_np[2, 3])
-
-                if sort_method == 'MIDPOINT':           # 1 — 区间中点
-                    sort_key = (near_end + far_end) * 0.5
-                    block_order = np.argsort(sort_key)
-
-                elif sort_method == 'INTERVAL_AWARE':   # 2 — 区间重叠感知
-                    mid = (near_end + far_end) * 0.5
-                    z_extent = far_end - near_end
-                    bin_size = max(np.mean(z_extent) * 0.5, 0.01)
-                    block_order = np.lexsort((mid, np.floor(near_end / bin_size)))
-                    sort_key = near_end
-
-                elif sort_method == 'MINZ_AREA':         # 5 — MinZ + 投影面积
-                    size = hi - lo
-                    proj_area = (size[:, 0] * size[:, 1] +
-                                 size[:, 0] * size[:, 2] +
-                                 size[:, 1] * size[:, 2])
-                    proj_area = proj_area / np.maximum(near_end * near_end, 1e-6)
-                    z_extent = far_end - near_end
-                    bin_size = max(np.mean(z_extent) * 0.5, 0.01)
-                    block_order = np.lexsort((-proj_area, np.floor(near_end / bin_size)))
-                    sort_key = near_end
-
-                else:                                   # 6 — 近裁剪面距离
-                    near_clip_z = -0.001
-                    crosses_clip = (near_end > -near_clip_z) & (far_end <= -near_clip_z)
-                    sort_key = np.where(crosses_clip, -1e9, near_end)
-                    block_order = np.argsort(sort_key)
-
-            elif sort_method == 'AABB_3D_DIST':         # 3 — AABB三维距离
-                closest_pt = np.clip(inst._camera_pos_np[None, :], lo, hi)
-                sort_key = np.linalg.norm(closest_pt - inst._camera_pos_np[None, :], axis=1)
-                block_order = np.argsort(sort_key)
-
-            elif sort_method == 'WEIGHTED_Z':           # 4 — 角点加权Z
-                view_np = np.asarray(view_matrix, dtype=np.float32)
-                vz = view_np[2:3, :3]
-                lo_x, lo_y, lo_z = lo[:, 0], lo[:, 1], lo[:, 2]
-                hi_x, hi_y, hi_z = hi[:, 0], hi[:, 1], hi[:, 2]
-                corners = np.stack([
-                    np.column_stack([lo_x, lo_y, lo_z]),
-                    np.column_stack([hi_x, lo_y, lo_z]),
-                    np.column_stack([hi_x, hi_y, lo_z]),
-                    np.column_stack([lo_x, hi_y, lo_z]),
-                    np.column_stack([lo_x, lo_y, hi_z]),
-                    np.column_stack([hi_x, lo_y, hi_z]),
-                    np.column_stack([hi_x, hi_y, hi_z]),
-                    np.column_stack([lo_x, hi_y, hi_z]),
-                ], axis=1)
-                view_z = -(np.dot(corners, vz.T).squeeze(-1) + view_np[2, 3])
-                delta = corners - inst._camera_pos_np[None, None, :]
-                dist = np.linalg.norm(delta, axis=2)
-                w = 1.0 / np.maximum(dist, 1e-6)
-                sort_key = np.sum(view_z * w, axis=1) / np.sum(w, axis=1)
-                block_order = np.argsort(sort_key)
-
-            else:                                       # fallback — nearest Z
-                view_np = np.asarray(view_matrix, dtype=np.float32)
-                vz = view_np[2:3, :3]
-                near_pick = np.where(vz > 0, hi, lo)
-                near_end = -((near_pick * vz).sum(axis=1) + view_np[2, 3])
-                sort_key = near_end
-                block_order = np.argsort(sort_key)
-
+            near_pick = np.where(vz > 0, hi, lo)
+            far_pick = np.where(vz > 0, lo, hi)
+            near_end = -((near_pick * vz).sum(axis=1) + view_np[2, 3])
+            far_end = -((far_pick * vz).sum(axis=1) + view_np[2, 3])
+            sort_key = (near_end + far_end) * 0.5
+            block_order = np.argsort(sort_key)
             if not near_to_far:
                 block_order = block_order[::-1]
 
@@ -609,7 +537,6 @@ class SplattingRenderer:
                 'cam_local': camera_pos_local,
                 'ui': ui_item,
                 'inst': inst,
-                'debug_mix': splatting_props.debug_mix,
             }
             inst_drawn_blocks[inst_idx] = 0
             inst_drawn_splats[inst_idx] = 0
@@ -649,8 +576,6 @@ class SplattingRenderer:
 
             batch = data['inst']._get_or_create_block_batch(block_idx)
             if batch:
-                bound_shader.uniform_float(
-                    "u_BlockIdx", draw_idx / len(draw_entries))
                 batch.draw(bound_shader)
                 inst_drawn_blocks[inst_idx] += 1
                 splats = max(1, len(data['inst'].block_splat_indices[block_idx]))
@@ -676,7 +601,6 @@ class SplattingRenderer:
                 self._bind_instance_uniforms(shader, data, is_sh)
                 batch = inst._get_or_create_fallback_batch()
                 if batch:
-                    shader.uniform_float("u_BlockIdx", 1.0)
                     batch.draw(shader)
                     inst_drawn_blocks[inst_idx] = inst.block_count
                     inst_drawn_splats[inst_idx] = max(1, inst.point_count // 16)

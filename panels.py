@@ -72,6 +72,8 @@ class SPLATTING_PT_panel(types.Panel):
                 if obj and obj.type == 'MESH':
                     meshes_body.separator()
                     has_probes = len(obj.probe_points) > 0
+                    meshes_body.prop(splatting_props, "bake_gain", text="Bake Gain", slider=True)
+                    meshes_body.prop(splatting_props, "bake_gain_start", text="Gain Start", slider=True)
                     row = meshes_body.row(align=True)
                     row.operator("splatting.bake_lightprobe", text="Bake Light Probe", icon='LIGHTPROBE_VOLUME')
                     if has_probes:
@@ -100,11 +102,7 @@ class SPLATTING_PT_panel(types.Panel):
                 settings_body.prop(splatting_props, "block_size", text="Block Size")
                 settings_body.prop(splatting_props, "clip_alpha", text="Clip Alpha")
                 settings_body.prop(splatting_props, "clip_size", text="Clip Size")
-
-            if splatting_props.is_rendering:
-                settings_body.prop(splatting_props, "block_sort_method", text="Sort Method")
-                settings_body.separator()
-                settings_body.prop(splatting_props, "debug_mix", text="Debug Mix", slider=True)
+                
 
             # # Debug section (visible when not rendering)
             # if not splatting_props.is_rendering:

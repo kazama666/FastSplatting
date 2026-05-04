@@ -76,18 +76,6 @@ Fast Spatting does not support for render pipline, so if you want to export anim
 
 While rendering, the panel shows total and displayed block/splat counts.
 
-## Architecture
-
-```
-Fast Splatting/
-├── __init__.py           # Plugin metadata, registration
-├── operators.py          # Blender operators
-├── panels.py             # UI sidebar panel, scene properties
-├── splatting_data.py     # Data loading, spatial index, state management, sorting
-├── gpu_renderer.py       # GPU batch building, GLSL shader, draw loop
-└── blender_manifest.toml # Blender extension manifest
-```
-
 ## Performance Notes
 
 - Splat count and block size determine memory and draw-call overhead. Larger block size = fewer blocks = fewer draw calls but coarser culling

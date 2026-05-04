@@ -672,38 +672,30 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         positions_h = np.concatenate([positions, ones], axis=1)
         positions_world = (positions_h @ mat.T)[:, :3]
 
-        # Grid origin aligned with block division (bound_box-based, same
-        # as _frozen_grid_min/max used in the block grid overlay).
+        # Get probe positions from the preview cache (density-based placement)
+        from .splatting_data import get_probe_positions, try_update_probe_preview
+        try_update_probe_preview(context)
+        probe_positions = get_probe_positions('irradiance')
+        if probe_positions is None or len(probe_positions) == 0:
+            self.report({'ERROR'}, "No probe positions — enable Irradiance preview first")
+            return {'CANCELLED'}
+        probe_positions = np.asarray(probe_positions, dtype=np.float32)
+        num_probes = len(probe_positions)
+
+        # Block-grid dimensions for splat filtering only (not probe placement)
         bbox_local = np.array(obj.bound_box, dtype=np.float32)
         ones_8 = np.ones((8, 1), dtype=np.float32)
         corners_h = np.concatenate([bbox_local, ones_8], axis=1)
         corners_w = (corners_h @ mat.T)[:, :3]
         min_coords = corners_w.min(axis=0)
         max_coords = corners_w.max(axis=0)
-
         block_size = props.block_size
         offset = np.array(props.block_offset, dtype=np.float32)
         origin = min_coords + offset
-
-        # Grid points at block intersections, excluding outermost layer.
-        nx = max(1, int(np.ceil((max_coords[0] - origin[0]) / block_size)) + 1)
-        ny = max(1, int(np.ceil((max_coords[1] - origin[1]) / block_size)) + 1)
-        nz = max(1, int(np.ceil((max_coords[2] - origin[2]) / block_size)) + 1)
-        xs = origin[0] + np.arange(nx) * block_size
-        ys = origin[1] + np.arange(ny) * block_size
-        zs = origin[2] + np.arange(nz) * block_size
-
-        grid_x, grid_y, grid_z = np.meshgrid(xs, ys, zs, indexing='ij')
-        # Interior mask: keep only points not on the outer shell
-        ig_x, ig_y, ig_z = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
-        interior = (ig_x > 0) & (ig_x < nx - 1) & (ig_y > 0) & (ig_y < ny - 1) & (ig_z > 0) & (ig_z < nz - 1)
-        probe_positions = np.stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()], axis=1)
-        probe_positions = probe_positions[interior.ravel()]
-
-        num_probes = len(probe_positions)
-        if num_probes == 0:
-            self.report({'ERROR'}, "No grid positions generated")
-            return {'CANCELLED'}
+        ncx = max(1, int(np.ceil((max_coords[0] - origin[0]) / block_size)))
+        ncy = max(1, int(np.ceil((max_coords[1] - origin[1]) / block_size)))
+        ncz = max(1, int(np.ceil((max_coords[2] - origin[2]) / block_size)))
+        num_blocks = ncx * ncy * ncz
 
         # Clear existing probes
         obj.probe_points.clear()
@@ -723,10 +715,6 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         # selected splats are spatially distributed within each block.
         # ------------------------------------------------------------------
         SUBDIV = 3  # sub-blocks per axis
-        ncx = max(1, nx - 1)
-        ncy = max(1, ny - 1)
-        ncz = max(1, nz - 1)
-        num_blocks = ncx * ncy * ncz
 
         brightness = flat_dc.max(axis=1)
         splat_size = scales.max(axis=1)
@@ -813,6 +801,7 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         context.window_manager.progress_begin(0, num_probes)
         num_stored = 0
         gain = props.bake_gain
+        inv_mat = np.linalg.inv(mat)
 
         for pi in range(num_probes):
             if pi % 5 == 0 or pi == num_probes - 1:
@@ -871,7 +860,9 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
             sh_b *= window
 
             pt = obj.probe_points.add()
-            pt.location = (float(pp[0]), float(pp[1]), float(pp[2]))
+            # Store position in local space
+            local_pp = inv_mat @ np.append(pp, 1.0)
+            pt.location = (float(local_pp[0]), float(local_pp[1]), float(local_pp[2]))
             pt.sh_r = sh_r.tolist()
             pt.sh_g = sh_g.tolist()
             pt.sh_b = sh_b.tolist()
@@ -880,7 +871,26 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         context.window_manager.progress_end()
         # Invalidate probe cache so runtime picks up the new bake immediately
         from . import splatting_data
-        splatting_data._probe_cache_valid = False
+        splatting_data.invalidate_irradiance_cache()
+
+        # Save bake bbox (8 local-space corners) + bake matrix.
+        if num_stored > 0:
+            bc = np.array(props.bake_area_center, dtype=np.float32)
+            bh = np.array(props.bake_area_size, dtype=np.float32) * 0.5
+            corners_w = np.array([
+                [bc[0] - bh[0], bc[1] - bh[1], bc[2] - bh[2], 1.0],
+                [bc[0] + bh[0], bc[1] - bh[1], bc[2] - bh[2], 1.0],
+                [bc[0] + bh[0], bc[1] + bh[1], bc[2] - bh[2], 1.0],
+                [bc[0] - bh[0], bc[1] + bh[1], bc[2] - bh[2], 1.0],
+                [bc[0] - bh[0], bc[1] - bh[1], bc[2] + bh[2], 1.0],
+                [bc[0] + bh[0], bc[1] - bh[1], bc[2] + bh[2], 1.0],
+                [bc[0] + bh[0], bc[1] + bh[1], bc[2] + bh[2], 1.0],
+                [bc[0] - bh[0], bc[1] + bh[1], bc[2] + bh[2], 1.0],
+            ], dtype=np.float32)
+            local_corners = (corners_w @ inv_mat.T)[:, :3]
+            obj.bake_bbox_corners = tuple(local_corners.ravel())
+            obj.bake_matrix_world = tuple(mat.ravel())
+
         self.report({'INFO'}, f"Baked {num_stored} light probes on '{obj.name}'")
         return {'FINISHED'}
 
@@ -906,8 +916,378 @@ class SPLATTING_OT_remove_lightprobe(types.Operator):
 
         n = len(obj.probe_points)
         obj.probe_points.clear()
+        obj.bake_bbox_corners = (0.0,) * 24
+        bake_mat_default = (1.0, 0.0, 0.0, 0.0,
+                            0.0, 1.0, 0.0, 0.0,
+                            0.0, 0.0, 1.0, 0.0,
+                            0.0, 0.0, 0.0, 1.0)
+        obj.bake_matrix_world = bake_mat_default
+        from . import splatting_data
+        splatting_data.invalidate_irradiance_cache()
         self.report({'INFO'}, f"Removed {n} light probes from '{obj.name}'")
         return {'FINISHED'}
+
+
+class SPLATTING_OT_bake_envmap(types.Operator):
+    bl_idname = "splatting.bake_envmap"
+    bl_label = "Bake Envmap"
+    bl_description = "Bake environment map probes at automatically placed positions and write to atlas texture"
+
+    # ------------------------------------------------------------------
+    # invoke
+    # ------------------------------------------------------------------
+    def invoke(self, context, event):
+        import numpy as np
+        from mathutils import Matrix
+
+        props = context.scene.splatting_properties
+        idx = props.active_instance_index
+        instances = context.scene.splatting_instances
+        if idx < 0 or idx >= len(instances):
+            self.report({'WARNING'}, "No instance selected")
+            return {'CANCELLED'}
+
+        item = instances[idx]
+        obj = bpy.data.objects.get(item.mesh_name)
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Instance mesh not found")
+            return {'CANCELLED'}
+
+        # Get envmap probe positions
+        from .splatting_data import get_probe_positions, try_update_probe_preview
+        try_update_probe_preview(context)
+        probe_positions = get_probe_positions('envmap')
+        if probe_positions is None or len(probe_positions) == 0:
+            self.report({'ERROR'}, "No envmap probe positions — enable Envmap preview first")
+            return {'CANCELLED'}
+
+        self._obj = obj
+        self._probe_positions = np.asarray(probe_positions, dtype=np.float32)
+        # Bake the first (center-most) probe position only
+        self._probe_pos = self._probe_positions[0]
+        from .envmap_utils import _FACE_NAMES
+        self._face_names = _FACE_NAMES
+
+        self._probe_res = props.envmap_probe_resolution
+        self._probe_w = self._probe_res
+
+        # ------------------------------------------------------------------
+        # Initialize renderer & load splat data if not already rendering
+        # ------------------------------------------------------------------
+        from .splatting_data import get_state, read_ply_attributes, build_spatial_index, SplattingState
+        scene_state = get_state()
+        self._was_rendering = scene_state.is_rendering
+        init_ok = True
+        if not self._was_rendering:
+            init_ok = self._init_renderer_data(context, obj, props, scene_state,
+                                               read_ply_attributes, build_spatial_index, SplattingState)
+        if not init_ok:
+            self.report({'ERROR'}, "Failed to initialize renderer data")
+            return {'CANCELLED'}
+
+        # Build perspective projection matrix manually (90° FOV, 1:1 aspect)
+        # OpenGL convention: cot(fov/2) on diagonal, standard frustum remapping
+        near, far = 0.1, 1000.0
+        f = 1.0  # cot(45°) for 90° vertical FOV
+        self._proj_matrix = Matrix((
+            (f, 0.0, 0.0, 0.0),
+            (0.0, f, 0.0, 0.0),
+            (0.0, 0.0, (far + near) / (near - far), 2.0 * far * near / (near - far)),
+            (0.0, 0.0, -1.0, 0.0),
+        ))
+
+        # Face forward/up vectors (must match envmap_utils._FACE_PARAMS)
+        face_lookat = {
+            'px': ('RIGHT', (0.0, -1.0, 0.0)),
+            'nx': ('LEFT', (0.0, -1.0, 0.0)),
+            'py': ('UP', (0.0, 0.0, 1.0)),
+            'ny': ('DOWN', (0.0, 0.0, -1.0)),
+            'pz': ('FRONT', (0.0, -1.0, 0.0)),
+            'nz': ('BACK', (0.0, -1.0, 0.0)),
+        }
+        forward_vectors = {
+            'RIGHT': (1.0, 0.0, 0.0),
+            'LEFT': (-1.0, 0.0, 0.0),
+            'UP': (0.0, 1.0, 0.0),
+            'DOWN': (0.0, -1.0, 0.0),
+            'FRONT': (0.0, 0.0, 1.0),
+            'BACK': (0.0, 0.0, -1.0),
+        }
+
+        self._view_matrices = {}
+        for name, (fwd_key, up) in face_lookat.items():
+            fwd_vec = forward_vectors[fwd_key]
+            # Manual LookAt at origin: build view matrix from forward/up vectors
+            import mathutils
+            fwd_v = mathutils.Vector(fwd_vec)
+            up_v = mathutils.Vector(up)
+            right_v = fwd_v.cross(up_v).normalized()
+            up_v = right_v.cross(fwd_v).normalized()  # re-orthogonalize
+            rot_view = mathutils.Matrix((
+                (right_v.x, right_v.y, right_v.z, 0.0),
+                (up_v.x, up_v.y, up_v.z, 0.0),
+                (-fwd_v.x, -fwd_v.y, -fwd_v.z, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            ))
+            self._view_matrices[name] = rot_view
+
+        # State
+        self._face_images = {}
+        self._phase = 'faces'
+        self._face_idx = 0
+        self._fully_sorted = False
+        self._offscreen = None
+
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.001, window=context.window)
+        return {'RUNNING_MODAL'}
+
+    # ------------------------------------------------------------------
+    # Renderer init (when not already rendering)
+    # ------------------------------------------------------------------
+    def _init_renderer_data(self, context, obj, props, scene_state,
+                            read_ply_attributes, build_spatial_index, SplattingState):
+        """Load splat data into the renderer state so draw_offscreen works.
+        Returns True on success, False on failure."""
+        import numpy as np
+
+        mesh = obj.data
+        if len(mesh.vertices) == 0:
+            return False
+
+        positions, colors, opacities, scales, rotations, raw_dc, sh_coeffs, sh_degree = \
+            read_ply_attributes(mesh)
+
+        # Alpha clip
+        clip_val = props.clip_alpha
+        if clip_val > 0.0:
+            mask = opacities.ravel() >= clip_val
+            kept = mask.sum()
+            if kept < len(positions):
+                positions = positions[mask]
+                colors = colors[mask]
+                opacities = opacities[mask]
+                scales = scales[mask]
+                rotations = rotations[mask]
+                raw_dc = raw_dc[mask]
+                if sh_coeffs is not None:
+                    sh_coeffs = sh_coeffs[mask]
+
+        # Size clip
+        size_val = props.clip_size
+        if size_val > 0.0:
+            mask = scales.mean(axis=1) >= size_val
+            kept = mask.sum()
+            if kept < len(positions):
+                positions = positions[mask]
+                colors = colors[mask]
+                opacities = opacities[mask]
+                scales = scales[mask]
+                rotations = rotations[mask]
+                raw_dc = raw_dc[mask]
+                if sh_coeffs is not None:
+                    sh_coeffs = sh_coeffs[mask]
+
+        inst = SplattingState()
+        inst.positions = positions
+        inst.display_colors = colors
+        inst.raw_dc = raw_dc
+        inst.sh_coeffs = sh_coeffs
+        inst.sh_degree = sh_degree
+        inst.opacities = opacities
+        inst.scales = scales
+        inst.rotations = rotations
+        inst.point_count = len(positions)
+        inst.target_mesh = obj
+
+        # Build spatial index in world space
+        mat = np.array(obj.matrix_world, dtype=np.float32)
+        ones = np.ones((len(positions), 1), dtype=np.float32)
+        positions_h = np.concatenate([positions, ones], axis=1)
+        positions_world = (positions_h @ mat.T)[:, :3]
+
+        bbox_local = np.array(obj.bound_box, dtype=np.float32)
+        ones_8 = np.ones((8, 1), dtype=np.float32)
+        corners_h = np.concatenate([bbox_local, ones_8], axis=1)
+        corners_w = (corners_h @ mat.T)[:, :3]
+        inst._frozen_grid_min = corners_w.min(axis=0).copy()
+        inst._frozen_grid_max = corners_w.max(axis=0).copy()
+        inst._frozen_positions_min = positions_world.min(axis=0).copy()
+        inst._frozen_positions_max = positions_world.max(axis=0).copy()
+
+        offset = props.block_offset
+        grid_ref = corners_w.min(axis=0)
+        pos_ref = positions_world.min(axis=0)
+        offset_arr = np.array(offset, dtype=np.float32)
+        adjusted = grid_ref + offset_arr - pos_ref
+
+        spatial = build_spatial_index(positions_world, block_size=props.block_size,
+                                      origin_offset=adjusted, use_parallel=True)
+        inst.block_indices = spatial['block_indices']
+        inst.grid_dims = spatial['grid_dims']
+        inst.block_centers = spatial['block_centers']
+        inst.block_radii = spatial['block_radii']
+        inst.block_bounds = spatial['block_bounds']
+        inst.block_splat_indices = spatial['block_splat_indices']
+        inst.block_count = len(spatial['unique_blocks'])
+
+        # Freeze originals for delta-based transform
+        inst._orig_block_centers = spatial['block_centers'].copy()
+        inst._orig_block_radii = spatial['block_radii'].copy()
+        inst._orig_block_bounds = spatial['block_bounds'].copy()
+        inst._orig_model_matrix = np.array(obj.matrix_world, dtype=np.float32)
+        inst._orig_model_inv = np.linalg.inv(inst._orig_model_matrix)
+
+        # Clear & add to scene state
+        scene_state.clear()
+        scene_state.instances.append(inst)
+
+        # Initialize GPU renderer
+        from .gpu_renderer import init_renderer
+        success = init_renderer()
+        if not success:
+            scene_state.clear()
+            self.report({'ERROR'}, "GPU renderer initialization failed")
+            return False
+
+        # Sort for the probe position
+        pp = self._probe_pos
+        from mathutils import Vector
+        from .splatting_data import sort_blocks_far_to_near
+        sort_blocks_far_to_near(Vector((float(pp[0]), float(pp[1]), float(pp[2]))))
+        self._fully_sorted = True
+        return True
+
+    # ------------------------------------------------------------------
+    # modal
+    # ------------------------------------------------------------------
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._cleanup(context)
+            return {'CANCELLED'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if self._phase == 'faces':
+            self._render_next_face(context)
+        elif self._phase == 'generate':
+            self._generate_mip_chain(context)
+        elif self._phase == 'pack':
+            self._pack_and_store(context)
+            self._cleanup(context)
+            self.report({'INFO'}, f"Envmap atlas stored on '{self._obj.name}'")
+            return {'FINISHED'}
+
+        return {'RUNNING_MODAL'}
+
+    # ------------------------------------------------------------------
+    # Phase A: Render 6 cubemap faces
+    # ------------------------------------------------------------------
+    def _render_next_face(self, context):
+        import gpu
+        from gpu.types import GPUOffScreen
+        from mathutils import Matrix
+
+        probe_pos = self._probe_pos
+        name = self._face_names[self._face_idx]
+        res = self._probe_res
+
+        if self._offscreen is None:
+            self._offscreen = GPUOffScreen(res, res)
+
+        # Build view matrix with probe position as eye:
+        #   V = R * T(-probe_pos)  → first translate, then rotate
+        pp = (float(probe_pos[0]), float(probe_pos[1]), float(probe_pos[2]))
+        vm = self._view_matrices[name] @ Matrix.Translation((-pp[0], -pp[1], -pp[2]))
+        camera_pos_world = pp
+
+        with self._offscreen.bind():
+            from .gpu_renderer import get_renderer
+            renderer = get_renderer()
+            pixels = renderer.draw_offscreen(
+                context, res, res,
+                vm, self._proj_matrix,
+                camera_pos_world,
+                skip_sort=self._fully_sorted,
+            )
+            self._face_images[name] = pixels
+
+        self._fully_sorted = True
+        self._face_idx += 1
+
+        if self._face_idx >= 6:
+            self._phase = 'generate'
+
+    # ------------------------------------------------------------------
+    # Phase B+C: Generate mip chain from cubemap faces
+    # ------------------------------------------------------------------
+    def _generate_mip_chain(self, context):
+        from .envmap_utils import generate_specular_mip_chain
+
+        self._offscreen.free()
+        self._offscreen = None
+
+        self._mip_chain = generate_specular_mip_chain(
+            self._face_images, self._probe_w, levels=6, samples_per_pixel=256)
+        self._face_images = None
+        self._phase = 'pack'
+
+    # ------------------------------------------------------------------
+    # Phase D: Pack atlas & store
+    # ------------------------------------------------------------------
+    def _pack_and_store(self, context):
+        import bpy
+        from .envmap_utils import pack_mip_atlas
+
+        atlas_data, (atlas_w, atlas_h) = pack_mip_atlas(self._mip_chain)
+
+        # Create image in Blender
+        name = f"{self._obj.name}_envmap_atlas"
+        existing = bpy.data.images.get(name)
+        if existing:
+            bpy.data.images.remove(existing)
+
+        img = bpy.data.images.new(name, width=atlas_w, height=atlas_h,
+                                  float_buffer=True, alpha=True)
+        img.pixels = atlas_data.ravel()
+
+        # Store reference on the object
+        self._obj.envmap_atlas = name
+
+        # Auto-update FS_PBR_BRDF node group's EnvImage nodes
+        ng = bpy.data.node_groups.get('FS_PBR_BRDF')
+        if ng:
+            updated = 0
+            for node in ng.nodes:
+                if node.type == 'TEX_IMAGE' and node.label == 'EnvImage':
+                    node.image = img
+                    updated += 1
+            if updated:
+                print(f"[Envmap] Updated {updated} EnvImage node(s) in FS_PBR_BRDF")
+            else:
+                print(f"[Envmap] FS_PBR_BRDF found but no EnvImage nodes")
+        else:
+            print(f"[Envmap] FS_PBR_BRDF node group not found, skip auto-update")
+
+        self._mip_chain = None
+
+    # ------------------------------------------------------------------
+    # cleanup
+    # ------------------------------------------------------------------
+    def _cleanup(self, context):
+        if self._offscreen is not None:
+            self._offscreen.free()
+            self._offscreen = None
+        if hasattr(self, '_timer'):
+            context.window_manager.event_timer_remove(self._timer)
+
+        # If we temporarily initialized the renderer, clean up
+        if not getattr(self, '_was_rendering', True):
+            from .splatting_data import get_state
+            from .gpu_renderer import release_renderer
+            release_renderer()
+            get_state().clear()
 
 
 _operators = [
@@ -924,6 +1304,7 @@ _operators = [
     SPLATTING_OT_set_default_render,
     SPLATTING_OT_bake_lightprobe,
     SPLATTING_OT_remove_lightprobe,
+    SPLATTING_OT_bake_envmap,
 ]
 
 

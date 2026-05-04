@@ -360,59 +360,18 @@ class SplattingRenderer:
         if is_sh:
             shader.uniform_float("u_CameraPos", data['cam_local'])
 
-    def draw(self, context):
-        """Draw all splat instances with global block-level sorting for correct
-        alpha blending across objects."""
-        if not self.initialized:
-            return
-        if self.shader_simple is None and self.shader_full is None:
-            return
+    def _render_to_framebuffer(self, context, vp_w, vp_h,
+                                view_matrix, proj_matrix,
+                                camera_pos_world, is_ortho):
+        """Core rendering: block culling, sorting, drawing.
 
-        # --- Viewport / projection setup ---
-        vp_matrix = Matrix.Identity(4)
-        view_matrix = Matrix.Identity(4)
-        camera = None
-        region3d = None
-
-        is_ortho = False
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                region3d = area.spaces.active.region_3d
-                is_camera_view = region3d.view_perspective == 'CAMERA'
-                camera = context.scene.camera if is_camera_view else None
-                if is_camera_view:
-                    is_ortho = camera and camera.data.type == 'ORTHO'
-                else:
-                    is_ortho = region3d.view_perspective == 'ORTHO'
-                break
-        viewport = state.viewport_get()
-        vp_w, vp_h = viewport[2], viewport[3]
-        if vp_w <= 0 or vp_h <= 0:
-            return
-        focal = vp_w * 0.5
-
-        if camera:
-            depsgraph = context.evaluated_depsgraph_get()
-            view_matrix = camera.matrix_world.inverted()
-            proj_matrix = camera.calc_matrix_camera(
-                depsgraph,
-                x=context.scene.render.resolution_x,
-                y=context.scene.render.resolution_y,
-            )
-            vp_matrix = proj_matrix @ view_matrix
-            focal = proj_matrix[0][0] * vp_w * 0.5
-        elif region3d:
-            view_matrix = region3d.view_matrix
-            proj_matrix = region3d.window_matrix
-            vp_matrix = proj_matrix @ view_matrix
-            focal = proj_matrix[0][0] * vp_w * 0.5
-        else:
-            return
-
+        GPU state (viewport, blend, depth) and active framebuffer must be
+        set by the caller beforehand.
+        """
+        vp_matrix = proj_matrix @ view_matrix
+        focal = proj_matrix[0][0] * vp_w * 0.5
         proj_00 = proj_matrix[0][0]
         proj_11 = proj_matrix[1][1]
-
-        gpu.state.viewport_set(0, 0, vp_w, vp_h)
 
         from .splatting_data import get_state
         scene = get_state()
@@ -421,20 +380,7 @@ class SplattingRenderer:
             return
 
         splatting_props = context.scene.splatting_properties
-
-        # --- State setup ---
-        state.blend_set('ALPHA_PREMULT')
-        state.depth_mask_set(False)
-        state.depth_test_set('LESS')
-
         near_to_far = splatting_props.sort_near_to_far
-
-        # --- World-space camera position (same for all instances) ---
-        if camera:
-            camera_pos_world = camera.matrix_world.translation
-        else:
-            view_matrix_inv = region3d.view_matrix.inverted()
-            camera_pos_world = view_matrix_inv.translation
         camera_world_np = np.array(
             [camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]], dtype=np.float32)
 
@@ -448,16 +394,17 @@ class SplattingRenderer:
         total_drawn_blocks = 0
         total_drawn_splats = 0
 
+        # Build UI lookup dict (avoids O(nÂ²) linear scan per instance)
+        ui_lookup = {}
+        for item in context.scene.splatting_instances:
+            ui_lookup[item.mesh_name] = item
+
         for inst_idx, inst in enumerate(scene.instances):
             if inst.point_count == 0 or inst.target_mesh is None:
                 continue
 
-            # Check UI toggle
-            ui_item = None
-            for item in context.scene.splatting_instances:
-                if item.mesh_name == inst.target_mesh.name:
-                    ui_item = item
-                    break
+            # Check UI toggle (O(1) dict lookup)
+            ui_item = ui_lookup.get(inst.target_mesh.name)
             if ui_item is None or not ui_item.enabled:
                 continue
 
@@ -475,7 +422,7 @@ class SplattingRenderer:
             inst._proj_00 = proj_00
             inst._proj_11 = proj_11
 
-            # Apply delta transform to block centers for animated/transformed objects
+            # Apply delta transform to block centers for animated objects
             if inst._orig_model_matrix is not None:
                 model_np = np.asarray(model_matrix, dtype=np.float32)
                 delta = model_np @ inst._orig_model_inv
@@ -484,7 +431,6 @@ class SplattingRenderer:
                 inst.block_centers[:] = (centers_h @ delta.T)[:, :3]
                 s = max(np.linalg.norm(delta[:3, i]) for i in range(3))
                 inst.block_radii[:] = inst._orig_block_radii * s
-                # Approximate AABB transform: scale half-extents by s around center
                 lo = inst._orig_block_bounds[:, 0, :]
                 hi = inst._orig_block_bounds[:, 1, :]
                 half = (hi - lo) * 0.5 * s
@@ -550,7 +496,7 @@ class SplattingRenderer:
         # Phase 3: Draw with per-instance shader + uniform switching
         # =====================================================================
         current_inst_idx = -1
-        bound_shader = None   # currently bound shader object
+        bound_shader = None
 
         for draw_idx, (inst_idx, block_idx, _) in enumerate(draw_entries):
             data = inst_data[inst_idx]
@@ -563,14 +509,12 @@ class SplattingRenderer:
                 else:
                     shader = self.shader_full if is_sh else self.shader_simple
 
-                # Bind shader and set viewport-level uniforms if switching variant
                 if shader is not bound_shader:
                     shader.bind()
                     bound_shader = shader
                     shader.uniform_float("u_FocalParams", (focal, focal))
                     shader.uniform_float("u_ViewportSize", (vp_w, vp_h))
 
-                # Per-instance uniforms
                 self._bind_instance_uniforms(shader, data, is_sh)
                 current_inst_idx = inst_idx
 
@@ -612,12 +556,110 @@ class SplattingRenderer:
             data['inst'].displayed_block_count = inst_drawn_blocks[inst_idx]
             data['inst'].displayed_splat_count = inst_drawn_splats[inst_idx]
 
-        # Update scene-level stats
         scene.displayed_block_count = total_drawn_blocks
         scene.displayed_splat_count = total_drawn_splats
 
-        # --- Reset blend ---
+    def draw(self, context):
+        """Draw all splat instances into the current viewport."""
+        if not self.initialized:
+            return
+        if self.shader_simple is None and self.shader_full is None:
+            return
+
+        # --- Viewport / projection setup ---
+        vp_matrix = Matrix.Identity(4)
+        view_matrix = Matrix.Identity(4)
+        camera = None
+        region3d = None
+
+        is_ortho = False
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                region3d = area.spaces.active.region_3d
+                is_camera_view = region3d.view_perspective == 'CAMERA'
+                camera = context.scene.camera if is_camera_view else None
+                if is_camera_view:
+                    is_ortho = camera and camera.data.type == 'ORTHO'
+                else:
+                    is_ortho = region3d.view_perspective == 'ORTHO'
+                break
+        viewport = state.viewport_get()
+        vp_w, vp_h = viewport[2], viewport[3]
+        if vp_w <= 0 or vp_h <= 0:
+            return
+
+        if camera:
+            depsgraph = context.evaluated_depsgraph_get()
+            view_matrix = camera.matrix_world.inverted()
+            proj_matrix = camera.calc_matrix_camera(
+                depsgraph,
+                x=context.scene.render.resolution_x,
+                y=context.scene.render.resolution_y,
+            )
+            camera_pos_world = camera.matrix_world.translation
+        elif region3d:
+            view_matrix = region3d.view_matrix
+            proj_matrix = region3d.window_matrix
+            view_matrix_inv = view_matrix.inverted()
+            camera_pos_world = view_matrix_inv.translation
+        else:
+            return
+
+        # --- State setup ---
+        state.blend_set('ALPHA_PREMULT')
+        state.depth_mask_set(False)
+        state.depth_test_set('LESS')
+        gpu.state.viewport_set(0, 0, vp_w, vp_h)
+
+        self._render_to_framebuffer(
+            context, vp_w, vp_h,
+            view_matrix, proj_matrix,
+            camera_pos_world, is_ortho,
+        )
+
         state.blend_set('NONE')
+
+    def draw_offscreen(self, context, width, height,
+                       view_matrix, proj_matrix,
+                       camera_pos_world, skip_sort=False):
+        """Render to the currently-bound off-screen framebuffer and return pixels.
+
+        Performs a full sort before rendering (blocks sorted far-to-near from
+        the given camera position), unless ``skip_sort`` is True (caller has
+        already sorted).  Returns a (height, width, 4) float32 numpy array
+        in RGBA.
+
+        The caller must bind a GPUOffScreen before calling this method.
+        """
+        gpu.state.viewport_set(0, 0, width, height)
+        fb = gpu.state.active_framebuffer_get()
+        fb.clear(color=(0.0, 0.0, 0.0, 0.0))
+
+        state.blend_set('ALPHA_PREMULT')
+        state.depth_mask_set(False)
+        # Offscreen has no depth buffer — disable depth test to avoid
+        # undefined behavior on GPUs that reject fragments when missing.
+        state.depth_test_set('NONE')
+
+        if not skip_sort:
+            from .splatting_data import sort_blocks_far_to_near
+            sort_blocks_far_to_near((
+                camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]
+            ))
+
+        self._render_to_framebuffer(
+            context, width, height,
+            view_matrix, proj_matrix,
+            camera_pos_world, is_ortho=False,
+        )
+
+        buffer = fb.read_color(0, 0, width, height, 4, 0, 'UBYTE')
+        buffer.dimensions = width * height * 4
+        arr = np.asarray(buffer, dtype=np.uint8).reshape(height, width, 4)
+        pixels = arr.astype(np.float32) / 255.0
+
+        state.blend_set('NONE')
+        return pixels
 
     def release(self):
         """Release GPU resources"""
@@ -693,7 +735,7 @@ def _aabb_wireframe(lo, hi=None):
 
 _grid_draw_handle = None
 _round_point_shader = None
-_splat_aabb_cache = {}  # obj.session_uid -> (local_lo, local_hi)
+
 
 
 def _get_round_point_shader():
@@ -719,7 +761,7 @@ def _get_round_point_shader():
 
 
 def _grid_draw():
-    """Draw block grid overlay in 3D viewports."""
+    """Draw block grid overlay + probe previews in 3D viewports."""
     try:
         context = bpy.context
         scene = context.scene
@@ -727,26 +769,20 @@ def _grid_draw():
     except AttributeError:
         return
 
-    if not props.show_block_grid:
-        return
-
-    block_size = props.block_size
-    if block_size <= 0:
-        return
-
-    offset = np.array(props.block_offset, dtype=np.float32)
-
     from .splatting_data import get_state
     _ss = get_state()
 
-    # ------------------------------------------------------------------
-    # Collect world-space grid vertices from each instance / object
-    # ------------------------------------------------------------------
-    _all_world_verts = []  # list of (N,3) arrays in world space
-    _all_probe_verts = []  # list of (N,3) arrays — interior grid points (probe preview)
-    _all_aabb_verts = []   # list of (24,3) arrays — AABB wireframes
+    offset = np.array(props.block_offset, dtype=np.float32)
+    block_size = props.block_size
 
-    if _ss.is_rendering and _ss.instances:
+    # ------------------------------------------------------------------
+    # Collect world-space data
+    # ------------------------------------------------------------------
+    # Collect grid lines (only when show_block_grid is on)
+    _all_world_verts = []
+    _all_baked_probe_verts = []  # baked probe markers
+
+    if props.show_block_grid and _ss.is_rendering and _ss.instances:
         # During rendering: compute grid in frozen world space (same as
         # pre-render), then delta-transform each vertex by the current
         # matrix_world so the grid follows the object transform exactly.
@@ -791,13 +827,10 @@ def _grid_draw():
                     local_h = np.concatenate([np.array(lines, dtype=np.float32),
                                               np.ones((len(lines), 1), dtype=np.float32)], axis=1)
                     _all_world_verts.append((local_h @ delta.T)[:, :3])
-    else:
+
+    elif props.show_block_grid:
         # Before rendering: world-space AABB from object bound_box × matrix_world.
-        # Grid lines are drawn directly in world space, matching how
-        # build_spatial_index divides blocks at render-init time.
         items = scene.splatting_instances
-        if not items:
-            return
 
         # Combined world-space AABB across all enabled instances
         min_coords = None
@@ -821,105 +854,54 @@ def _grid_draw():
                     min_coords = np.minimum(min_coords, obj_min)
                     max_coords = np.maximum(max_coords, obj_max)
 
-        if min_coords is None:
-            return
+        if min_coords is not None:
+            # Generate grid lines directly in world space
+            origin = min_coords + offset
+            bs = block_size
 
-        # Generate grid lines directly in world space
-        origin = min_coords + offset
-        bs = block_size
+            xs = _steps(origin[0], origin[0] + int(np.ceil((max_coords[0] - origin[0]) / bs)) * bs, bs)
+            ys = _steps(origin[1], origin[1] + int(np.ceil((max_coords[1] - origin[1]) / bs)) * bs, bs)
+            zs = _steps(origin[2], origin[2] + int(np.ceil((max_coords[2] - origin[2]) / bs)) * bs, bs)
 
-        xs = _steps(origin[0], origin[0] + int(np.ceil((max_coords[0] - origin[0]) / bs)) * bs, bs)
-        ys = _steps(origin[1], origin[1] + int(np.ceil((max_coords[1] - origin[1]) / bs)) * bs, bs)
-        zs = _steps(origin[2], origin[2] + int(np.ceil((max_coords[2] - origin[2]) / bs)) * bs, bs)
+            if len(xs) >= 2 or len(ys) >= 2 or len(zs) >= 2:
+                x_min, x_max = xs[0], xs[-1]
+                y_min, y_max = ys[0], ys[-1]
+                z_min, z_max = zs[0], zs[-1]
 
-        if len(xs) >= 2 or len(ys) >= 2 or len(zs) >= 2:
-            x_min, x_max = xs[0], xs[-1]
-            y_min, y_max = ys[0], ys[-1]
-            z_min, z_max = zs[0], zs[-1]
-
-            lines = []
-            for y in ys:
-                for z in zs:
-                    lines.append([x_min, y, z])
-                    lines.append([x_max, y, z])
-            for x in xs:
-                for z in zs:
-                    lines.append([x, y_min, z])
-                    lines.append([x, y_max, z])
-            for x in xs:
+                lines = []
                 for y in ys:
-                    lines.append([x, y, z_min])
-                    lines.append([x, y, z_max])
+                    for z in zs:
+                        lines.append([x_min, y, z])
+                        lines.append([x_max, y, z])
+                for x in xs:
+                    for z in zs:
+                        lines.append([x, y_min, z])
+                        lines.append([x, y_max, z])
+                for x in xs:
+                    for y in ys:
+                        lines.append([x, y, z_min])
+                        lines.append([x, y, z_max])
 
-            if lines:
-                _all_world_verts.append(np.array(lines, dtype=np.float32))
+                if lines:
+                    _all_world_verts.append(np.array(lines, dtype=np.float32))
 
     # ------------------------------------------------------------------
-    # Collect probe point positions from baked data
+    # Collect probe point positions from baked data (local → world via current matrix_world)
     # ------------------------------------------------------------------
     for item in scene.splatting_instances:
         if not item.enabled:
             continue
         obj = bpy.data.objects.get(item.mesh_name)
         if obj and obj.type == 'MESH' and len(obj.probe_points) > 0:
-            pts = np.array([list(pt.location) for pt in obj.probe_points], dtype=np.float32)
-            _all_probe_verts.append(pts)
-
-    # ------------------------------------------------------------------
-    # Collect AABB wireframe for each instance (from actual splat positions)
-    # ------------------------------------------------------------------
-    for item in scene.splatting_instances:
-        if not item.enabled:
-            continue
-        obj = bpy.data.objects.get(item.mesh_name)
-        if not obj or obj.type != 'MESH':
-            continue
-
-        if _ss.is_rendering and _ss.instances:
-            for inst in _ss.instances:
-                if inst._frozen_positions_min is None:
-                    continue
-                try:
-                    if inst.target_mesh.name != obj.name:
-                        continue
-                except ReferenceError:
-                    continue
-                lo = inst._frozen_positions_min
-                hi = inst._frozen_positions_max
-                aabb = _aabb_wireframe(lo, hi)
-                mat = np.array(obj.matrix_world, dtype=np.float32)
-                delta = mat @ inst._orig_model_inv
-                ones = np.ones((24, 1), dtype=np.float32)
-                _all_aabb_verts.append(
-                    (np.concatenate([aabb, ones], axis=1) @ delta.T)[:, :3])
-                break
-        else:
-            # Cache local-space positions AABB (keyed by session_uid)
-            uid = obj.session_uid
-            if uid not in _splat_aabb_cache:
-                n = len(obj.data.vertices)
-                pos = np.empty(n * 3, dtype=np.float32)
-                obj.data.vertices.foreach_get('co', pos)
-                pos = pos.reshape(-1, 3)
-                _splat_aabb_cache[uid] = (pos.min(axis=0), pos.max(axis=0))
-            lo_local, hi_local = _splat_aabb_cache[uid]
-            # 8 corners of local AABB → world → world AABB (tight, not bound_box)
-            corners = np.array([
-                [lo_local[0], lo_local[1], lo_local[2]],
-                [hi_local[0], lo_local[1], lo_local[2]],
-                [hi_local[0], hi_local[1], lo_local[2]],
-                [lo_local[0], hi_local[1], lo_local[2]],
-                [lo_local[0], lo_local[1], hi_local[2]],
-                [hi_local[0], lo_local[1], hi_local[2]],
-                [hi_local[0], hi_local[1], hi_local[2]],
-                [lo_local[0], hi_local[1], hi_local[2]],
-            ], dtype=np.float32)
             mat = np.array(obj.matrix_world, dtype=np.float32)
-            corners_w = corners @ mat[:3, :3].T + mat[:3, 3]
-            _all_aabb_verts.append(_aabb_wireframe(corners_w))
+            pts_local = np.array([list(pt.location) for pt in obj.probe_points], dtype=np.float32)
+            ones = np.ones((len(pts_local), 1), dtype=np.float32)
+            pts_world = (np.concatenate([pts_local, ones], axis=1) @ mat.T)[:, :3]
+            _all_baked_probe_verts.append(pts_world)
 
-    if not _all_world_verts and not _all_probe_verts and not _all_aabb_verts:
-        return
+        if not _all_world_verts and not _all_baked_probe_verts:
+            if not props.irradiance_show_preview and not props.envmap_show_preview:
+                return
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     gpu.state.depth_test_set('ALWAYS')
@@ -940,8 +922,25 @@ def _grid_draw():
         shader.uniform_float("color", color)
         batch.draw(shader)
 
-    # Probe position markers (round dots via custom shader)
-    if _all_probe_verts:
+    # Baked probe markers + saved bbox wireframes (toggle-controlled)
+    if props.irradiance_show_preview and _all_baked_probe_verts:
+        # Collect bbox wireframes for baked instances
+        _baked_aabb_verts = []
+        for item in scene.splatting_instances:
+            if not item.enabled:
+                continue
+            obj = bpy.data.objects.get(item.mesh_name)
+            if obj and obj.type == 'MESH' and len(obj.probe_points) > 0:
+                corners = np.array(obj.bake_bbox_corners, dtype=np.float32).reshape(8, 3)
+            if np.any(corners):
+                # 12 edges from 8 corners (index pairs)
+                edges = [0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7]
+                box_pts = corners[edges].reshape(-1, 3)
+                mat = np.array(obj.matrix_world, dtype=np.float32)
+                ones = np.ones((len(box_pts), 1), dtype=np.float32)
+                _baked_aabb_verts.append(
+                    (np.concatenate([box_pts, ones], axis=1) @ mat.T)[:, :3])
+
         # Compute MVP matrix from the 3D viewport
         mvp = Matrix.Identity(4)
         for area in context.screen.areas:
@@ -949,7 +948,21 @@ def _grid_draw():
                 r3d = area.spaces.active.region_3d
                 mvp = r3d.window_matrix @ r3d.view_matrix
                 break
-        probe_all = np.concatenate(_all_probe_verts, axis=0)
+
+        # Draw baked bbox wireframes
+        if _baked_aabb_verts:
+            bbox_all = np.concatenate(_baked_aabb_verts, axis=0)
+            bbox_fmt = GPUVertFormat()
+            bbox_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            bbox_vbo = GPUVertBuf(bbox_fmt, len(bbox_all))
+            bbox_vbo.attr_fill(id="pos", data=bbox_all)
+            bbox_batch = GPUBatch(type='LINES', buf=bbox_vbo)
+            shader.bind()
+            shader.uniform_float("color", (0.0, 0.8, 0.3, 0.6))
+            bbox_batch.draw(shader)
+
+        # Draw baked probe dots
+        probe_all = np.concatenate(_all_baked_probe_verts, axis=0)
         probe_fmt = GPUVertFormat()
         probe_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
         probe_vbo = GPUVertBuf(probe_fmt, len(probe_all))
@@ -963,17 +976,60 @@ def _grid_draw():
         probe_batch.draw(round_shader)
         gpu.state.point_size_set(1)
 
-    # AABB wireframes (blue)
-    if _all_aabb_verts:
-        aabb_all = np.concatenate(_all_aabb_verts, axis=0)
-        aabb_fmt = GPUVertFormat()
-        aabb_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        aabb_vbo = GPUVertBuf(aabb_fmt, len(aabb_all))
-        aabb_vbo.attr_fill(id="pos", data=aabb_all)
-        aabb_batch = GPUBatch(type='LINES', buf=aabb_vbo)
+    # Probe previews (auto-placed positions, not yet baked)
+    # Draw the bake area bounding box if any auto-placed preview is active
+    if (props.irradiance_show_preview and not _all_baked_probe_verts) or props.envmap_show_preview:
+        center = np.array(props.bake_area_center, dtype=np.float32)
+        half = np.array(props.bake_area_size, dtype=np.float32) * 0.5
+        bb_lo = center - half
+        bb_hi = center + half
+        bake_bbox = _aabb_wireframe(bb_lo, bb_hi)
+        bbox_fmt = GPUVertFormat()
+        bbox_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+        bbox_vbo = GPUVertBuf(bbox_fmt, len(bake_bbox))
+        bbox_vbo.attr_fill(id="pos", data=bake_bbox)
+        bbox_batch = GPUBatch(type='LINES', buf=bbox_vbo)
         shader.bind()
-        shader.uniform_float("color", (0.0, 0.3, 0.8, 0.7))
-        aabb_batch.draw(shader)
+        shader.uniform_float("color", (1.0, 0.6, 0.0, 0.5))
+        bbox_batch.draw(shader)
+
+    _probe_drawn = False
+    for probe_type, show_prop, color, psize in [
+        ('irradiance', props.irradiance_show_preview, (0.2, 0.8, 0.2, 0.9), 14),
+        ('envmap', props.envmap_show_preview, (0.2, 0.4, 1.0, 0.9), 28),
+    ]:
+        if not show_prop:
+            continue
+        # Skip auto-placed irradiance preview if active instance already has baked data
+        if probe_type == 'irradiance' and _all_baked_probe_verts:
+            continue
+        from .splatting_data import try_update_probe_preview, get_probe_positions
+        try_update_probe_preview(context)
+        pos = get_probe_positions(probe_type)
+        if pos is not None and len(pos) > 0:
+            if not _probe_drawn:
+                try:
+                    _mvp = mvp
+                except NameError:
+                    _mvp = Matrix.Identity(4)
+                    for area in context.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            r3d = area.spaces.active.region_3d
+                            _mvp = r3d.window_matrix @ r3d.view_matrix
+                            break
+                _probe_drawn = True
+            fmt = GPUVertFormat()
+            fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            vbo = GPUVertBuf(fmt, len(pos))
+            vbo.attr_fill(id="pos", data=np.asarray(pos, dtype=np.float32))
+            batch = GPUBatch(type='POINTS', buf=vbo)
+            round_shader = _get_round_point_shader()
+            round_shader.bind()
+            round_shader.uniform_float("u_mvp", _mvp)
+            round_shader.uniform_float("u_color", color)
+            gpu.state.point_size_set(psize)
+            batch.draw(round_shader)
+            gpu.state.point_size_set(1)
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('LESS')

@@ -369,113 +369,279 @@ def get_state():
 
 
 # ---------------------------------------------------------------------------
+# Probe placement state (runtime only, not persisted)
+# ---------------------------------------------------------------------------
+_irradiance_probe_positions = None  # np.ndarray (N, 3) or None
+_envmap_probe_positions = None      # np.ndarray (N, 3) or None
+_probe_last_change_time = 0.0       # time.time() of last param change
+
+def mark_probe_preview_dirty():
+    """Called when user changes probe params — records timestamp for debounce."""
+    import time
+    global _probe_last_change_time
+    _probe_last_change_time = time.time()
+
+def get_probe_positions(probe_type='envmap'):
+    """Return cached probe positions, or None if not yet computed."""
+    global _irradiance_probe_positions, _envmap_probe_positions
+    if probe_type == 'irradiance':
+        return _irradiance_probe_positions
+    return _envmap_probe_positions
+
+
+def _farthest_point_sample(candidates, n, bb_lo, bb_hi, min_spacing=0.0):
+    """Farthest-point sampling from candidate positions.
+
+    Returns (n, 3) float32 array. The first point is always the
+    bounding-box center so that count=1 places a probe at center.
+    Subsequent points are farthest-point-sampled from candidates.
+    """
+    center = (bb_lo + bb_hi) * 0.5
+
+    if n <= 1:
+        return center.reshape(1, 3)
+
+    k = min(n - 1, len(candidates))  # number of farthest-point candidates to select
+    dists = np.linalg.norm(candidates - center, axis=1)
+    selected = [int(np.argmax(dists))]
+    selected_mask = np.zeros(len(candidates), dtype=bool)
+    selected_mask[selected[0]] = True
+
+    min_dists = np.full(len(candidates), np.inf, dtype=np.float32)
+    for _ in range(k - 1):
+        d = np.linalg.norm(candidates - candidates[selected[-1]], axis=1)
+        np.minimum(min_dists, d, out=min_dists)
+        if min_spacing > 0.0:
+            too_close = d < min_spacing
+            min_dists[too_close] = -1.0
+        next_idx = int(np.argmax(min_dists))
+        if min_dists[next_idx] <= 0:
+            break
+        selected.append(next_idx)
+        selected_mask[next_idx] = True
+
+    return np.vstack([center.reshape(1, 3), candidates[selected]])
+
+
+def compute_probe_positions(context):
+    """Compute both irradiance and envmap probe positions.
+
+    Uses ``bake_area_center`` ± ``bake_area_offset`` as the bounding box,
+    builds a density volume from splat positions, generates 64³ candidates,
+    filters by density threshold, and runs separate farthest-point sampling
+    for each probe type.
+
+    Returns (irradiance_positions, envmap_positions) or (None, None).
+    Caches both in module-level globals.
+    """
+    import numpy as np
+    import time
+    global _irradiance_probe_positions, _envmap_probe_positions
+
+    props = context.scene.splatting_properties
+    n_irr = props.irradiance_probe_count
+    n_env = props.envmap_probe_count
+
+    # Bake volume from center + size
+    center = np.array(props.bake_area_center, dtype=np.float32)
+    half = np.array(props.bake_area_size, dtype=np.float32) * 0.5
+    lo = center - half
+    hi = center + half
+    dims = np.array(props.bake_area_size, dtype=np.float32)
+    dims = np.maximum(dims, 1.0)
+
+    # Collect world-space splat positions from all enabled instances
+    all_positions = []
+    for item in context.scene.splatting_instances:
+        if not item.enabled:
+            continue
+        obj = bpy.data.objects.get(item.mesh_name)
+        if not obj or obj.type != 'MESH' or len(obj.data.vertices) == 0:
+            continue
+
+        n = len(obj.data.vertices)
+        pos = np.empty(n * 3, dtype=np.float32)
+        obj.data.vertices.foreach_get('co', pos)
+        pos = pos.reshape(-1, 3)
+
+        mat = np.array(obj.matrix_world, dtype=np.float32)
+        ones = np.ones((n, 1), dtype=np.float32)
+        pos_world = (np.concatenate([pos, ones], axis=1) @ mat.T)[:, :3]
+        all_positions.append(pos_world)
+
+    if not all_positions:
+        _irradiance_probe_positions = None
+        _envmap_probe_positions = None
+        return None, None
+
+    positions = np.concatenate(all_positions, axis=0)
+
+    # Density volume: 32³ voxels covering the bake volume
+    VOXEL_RES = 32
+    voxel_size = dims / VOXEL_RES
+    vox_ij = np.floor((positions - lo) / voxel_size).astype(np.int32)
+    in_bounds = ((vox_ij >= 0) & (vox_ij < VOXEL_RES)).all(axis=1)
+    vox_ij = vox_ij[in_bounds]
+    if len(vox_ij) == 0:
+        # No splats inside bake volume — spread evenly
+        _irradiance_probe_positions = _farthest_point_sample(
+            _generate_uniform_candidates(lo, hi, 64), n_irr, lo, hi)
+        _envmap_probe_positions = _farthest_point_sample(
+            _generate_uniform_candidates(lo, hi, 64), n_env, lo, hi)
+        return _irradiance_probe_positions, _envmap_probe_positions
+
+    flat_idx = (vox_ij[:, 0] * VOXEL_RES * VOXEL_RES
+                + vox_ij[:, 1] * VOXEL_RES + vox_ij[:, 2])
+    density = np.bincount(flat_idx, minlength=VOXEL_RES**3,
+                           ).astype(np.float32).reshape(VOXEL_RES, VOXEL_RES, VOXEL_RES)
+
+    # 3×3×3 box blur
+    density_smooth = np.zeros_like(density)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                s = np.roll(np.roll(np.roll(density, dx, 0), dy, 1), dz, 2)
+                density_smooth += s
+    density_smooth /= 27.0
+
+    # Candidate points: 64³ grid within the bake volume
+    candidates = _generate_uniform_candidates(lo, hi, 64)
+
+    # Look up smoothed density at each candidate
+    dv_ij = np.floor((candidates - lo) / voxel_size).astype(np.int32)
+    dv_ij = np.clip(dv_ij, 0, VOXEL_RES - 1)
+    cand_density = density_smooth[dv_ij[:, 0], dv_ij[:, 1], dv_ij[:, 2]]
+
+    # Keep bottom 30% density (open space)
+    max_n = max(n_irr, n_env)
+    threshold = max(np.percentile(cand_density, 30), 1.0)
+    keep = cand_density <= threshold
+    if keep.sum() < max_n:
+        threshold = np.percentile(cand_density, 50)
+        keep = cand_density <= threshold
+    if keep.sum() < max_n:
+        keep = np.ones(len(candidates), dtype=bool)
+
+    candidates = candidates[keep]
+    if len(candidates) == 0:
+        candidates = _generate_uniform_candidates(lo, hi, 64)
+
+    # Farthest-point for each probe type (always via _farthest_point_sample
+    # so the first point is always the bake-area center)
+    _irradiance_probe_positions = _farthest_point_sample(
+        candidates, n_irr, lo, hi) if n_irr > 0 else None
+    _envmap_probe_positions = _farthest_point_sample(
+        candidates, n_env, lo, hi) if n_env > 0 else None
+
+    return _irradiance_probe_positions, _envmap_probe_positions
+
+
+def _generate_uniform_candidates(lo, hi, res):
+    """Generate a ``res``×``res``×``res`` uniform grid of candidate points."""
+    dims = hi - lo
+    cell = dims / res
+    cx = lo[0] + cell[0] * (np.arange(res) + 0.5)
+    cy = lo[1] + cell[1] * (np.arange(res) + 0.5)
+    cz = lo[2] + cell[2] * (np.arange(res) + 0.5)
+    gx, gy, gz = np.meshgrid(cx, cy, cz, indexing='ij')
+    return np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+
+
+def try_update_probe_preview(context):
+    """Debounced preview update — called from draw handler.
+
+    If the debounce timer (1 s since last ``mark_probe_preview_dirty``)
+    has expired, recompute both probe position sets.
+    Returns True if positions are available (cached or fresh).
+    """
+    import time
+    global _probe_last_change_time
+    if _probe_last_change_time > 0 and time.time() - _probe_last_change_time >= 1.0:
+        _probe_last_change_time = 0.0
+        compute_probe_positions(context)
+    return (_irradiance_probe_positions is not None
+            or _envmap_probe_positions is not None)
+
+
+# ---------------------------------------------------------------------------
 # Irradiance probe interpolation (PRE_VIEW draw handler)
 # ---------------------------------------------------------------------------
 _irradiance_objects = []        # object names with "irradiance_from_splats" modifier
+_irradiance_objects_dirty = True  # re-scan needed
 _irradiance_update_idx = 0      # round-robin counter
 _irradiance_pre_handle = None   # PRE_VIEW draw handler handle
 _probe_cache_valid = False
 _probe_cache_grids = None   # list of dicts, one per instance with probe grid data
 
 
-def _extract_grid(probes):
-    """From a probe_points collection, reconstruct grid metadata + SH data."""
+def _extract_scattered(probes):
+    """From a probe_points collection, build scattered probe data for IDW.
+
+    Probes are now placed via farthest-point sampling (not a grid),
+    so we skip grid deduction and store raw positions + SH data.
+    """
+    if len(probes) < 1:
+        return None
     positions = np.array([list(p.location) for p in probes], dtype=np.float32)
     sh_r = np.array([list(p.sh_r) for p in probes], dtype=np.float32)
     sh_g = np.array([list(p.sh_g) for p in probes], dtype=np.float32)
     sh_b = np.array([list(p.sh_b) for p in probes], dtype=np.float32)
-
-    # Deduce grid dimensions from unique coordinates
-    xs = np.unique(np.round(positions[:, 0], decimals=5))
-    ys = np.unique(np.round(positions[:, 1], decimals=5))
-    zs = np.unique(np.round(positions[:, 2], decimals=5))
-
-    ni, nj, nk = len(xs), len(ys), len(zs)
-    if ni < 2 or nj < 2 or nk < 2:
-        return None
-
-    bs = xs[1] - xs[0]
-    origin = np.array([xs[0] - bs, ys[0] - bs, zs[0] - bs])
     return {
-        'origin': origin,
-        'block_size': bs,
-        'ni': ni, 'nj': nj, 'nk': nk,     # interior count
         'positions': positions,
         'sh_r': sh_r, 'sh_g': sh_g, 'sh_b': sh_b,
     }
 
 
-def _trilinear(grid, pos):
-    """Trilinearly interpolate SH2 coefficients at world-space pos from a probe grid.
+def _idw_interpolate(scattered, local_pos, k=6, eps=1e-6):
+    """Gaussian RBF interpolation from k nearest probes with sorted distances.
 
-    Returns 9 RGB tuples (never None — clamps to nearest valid cell).
+    Uses Gaussian weighting exp(-d²/(2σ²)) with sigma = 0.4 × k-th-neighbor
+    distance so the farthest included probe contributes ≈0.04, making
+    entering/exiting the k-set invisible.  k indices are sorted so sigma
+    uses the true k-th distance.
+    Returns 9 RGB tuples (never None — falls back to first probe).
     """
-    o = grid['origin']
-    bs = grid['block_size']
-    ni, nj, nk = grid['ni'], grid['nj'], grid['nk']
-
-    # Full-grid coordinate
-    gx = (pos[0] - o[0]) / bs
-    gy = (pos[1] - o[1]) / bs
-    gz = (pos[2] - o[2]) / bs
-
-    # Clamp to nearest valid cell. Interior probes span full-grid indices [1, ni].
-    # A cell's left corner must be in [1, ni-1] so the right corner is ≤ ni.
-    ix = int(np.floor(np.clip(gx, 1, ni - 1)))
-    iy = int(np.floor(np.clip(gy, 1, nj - 1)))
-    iz = int(np.floor(np.clip(gz, 1, nk - 1)))
-
-    tx = min(max(gx - ix, 0.0), 1.0)
-    ty = min(max(gy - iy, 0.0), 1.0)
-    tz = min(max(gz - iz, 0.0), 1.0)
-
-    # 8 corner interior-flat indices
-    def _flat(i, j, k):
-        return (i - 1) * nj * nk + (j - 1) * nk + (k - 1)
-
-    c = [[ix, iy, iz], [ix + 1, iy, iz],
-         [ix, iy + 1, iz], [ix + 1, iy + 1, iz],
-         [ix, iy, iz + 1], [ix + 1, iy, iz + 1],
-         [ix, iy + 1, iz + 1], [ix + 1, iy + 1, iz + 1]]
-
-    w = [(1 - tx) * (1 - ty) * (1 - tz),
-         tx * (1 - ty) * (1 - tz),
-         (1 - tx) * ty * (1 - tz),
-         tx * ty * (1 - tz),
-         (1 - tx) * (1 - ty) * tz,
-         tx * (1 - ty) * tz,
-         (1 - tx) * ty * tz,
-         tx * ty * tz]
-
-    sh_r = np.zeros(9, dtype=np.float32)
-    sh_g = np.zeros(9, dtype=np.float32)
-    sh_b = np.zeros(9, dtype=np.float32)
-    for k in range(8):
-        idx = _flat(*c[k])
-        sh_r += grid['sh_r'][idx] * w[k]
-        sh_g += grid['sh_g'][idx] * w[k]
-        sh_b += grid['sh_b'][idx] * w[k]
-
+    pos = scattered['positions']
+    n = len(pos)
+    k = min(k, n)
+    d = np.linalg.norm(pos - local_pos, axis=1)
+    # k smallest, then sort by distance so d_k[-1] is truly the farthest
+    idx = np.argpartition(d, k)[:k]
+    idx = idx[np.argsort(d[idx])]
+    d_k = d[idx]
+    sigma = max(d_k[-1] * 0.4, 0.01) if k >= 2 else 1.0
+    w = np.exp(-d_k**2 / (2.0 * sigma**2))
+    w += eps
+    w /= w.sum()
+    sh_r = (scattered['sh_r'][idx] * w[:, None]).sum(axis=0)
+    sh_g = (scattered['sh_g'][idx] * w[:, None]).sum(axis=0)
+    sh_b = (scattered['sh_b'][idx] * w[:, None]).sum(axis=0)
     return [(float(sh_r[b]), float(sh_g[b]), float(sh_b[b])) for b in range(9)]
 
 
 def _refresh_probe_cache():
-    """Rebuild per-instance probe grid cache."""
+    """Rebuild per-instance scattered probe data cache."""
     global _probe_cache_grids, _probe_cache_valid
     _probe_cache_grids = []
     for inst in _scene.instances:
         if inst.target_mesh and hasattr(inst.target_mesh, 'probe_points'):
             probes = inst.target_mesh.probe_points
             if len(probes) > 0:
-                g = _extract_grid(probes)
+                g = _extract_scattered(probes)
                 if g is not None:
+                    g['target_mesh'] = inst.target_mesh
                     _probe_cache_grids.append(g)
     _probe_cache_valid = True
 
 
 def collect_irradiance_objects():
-    """Scan scene for meshes with a geometry node named 'irradiance_from_splats'."""
-    global _irradiance_objects
+    """Scan scene for meshes with a geometry node named 'irradiance_from_splats'.
+
+    Result is cached — only re-scans when _irradiance_objects_dirty is set.
+    """
+    global _irradiance_objects, _irradiance_objects_dirty
+    if not _irradiance_objects_dirty:
+        return
     _irradiance_objects = []
     for obj in bpy.context.scene.objects:
         if obj.type != 'MESH':
@@ -484,6 +650,14 @@ def collect_irradiance_objects():
             if mod.type == 'NODES' and mod.node_group and "irradiance_from_splats" in mod.node_group.name:
                 _irradiance_objects.append(obj.name)
                 break
+    _irradiance_objects_dirty = False
+
+
+def invalidate_irradiance_cache():
+    """Force collect_irradiance_objects to re-scan on next call."""
+    global _irradiance_objects_dirty, _probe_cache_valid
+    _irradiance_objects_dirty = True
+    _probe_cache_valid = False
 
 
 def _irradiance_pre_draw():
@@ -520,11 +694,17 @@ def _irradiance_pre_draw():
     if not target_mod:
         return
 
-    center = np.array(obj.matrix_world.translation, dtype=np.float32)
-
-    # Use the first probe grid (trilinear always succeeds with clamping).
+    # Use the first probe grid, transform receiver → target local space
     g = _probe_cache_grids[0]
-    bands = _trilinear(g, center)
+    target = g['target_mesh']
+    try:
+        mat = np.array(target.matrix_world, dtype=np.float32)
+        inv = np.linalg.inv(mat)
+        center = np.array(obj.matrix_world.translation, dtype=np.float32)
+        local_pos = (inv @ np.array([center[0], center[1], center[2], 1.0], dtype=np.float32))[:3]
+    except (ReferenceError, np.linalg.LinAlgError):
+        return
+    bands = _idw_interpolate(g, local_pos)
 
     # Write 9 Color inputs (SH_Band_0 … SH_Band_8) to the modifier
     try:
@@ -641,6 +821,56 @@ class SplattingProperties(types.PropertyGroup):
     ui_settings_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle settings section")
 
+    # --- Bake area & probes ---
+    bake_area_center: bpy.props.FloatVectorProperty(
+        name="Bake Center",
+        description="Center of the bake volume. Probes are placed within center ± offset.",
+        default=(0.0, 0.0, 0.0), size=3, subtype='TRANSLATION',
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+    bake_area_size: bpy.props.FloatVectorProperty(
+        name="Bake Size",
+        description="Full dimensions of the bake volume. Probes are placed within center ± size/2.",
+        default=(10.0, 10.0, 10.0), size=3, subtype='TRANSLATION',
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+
+    # Irradiance (SH) probes
+    irradiance_probe_count: bpy.props.IntProperty(
+        name="Irradiance Probes",
+        description="Number of irradiance (SH) probes to place",
+        default=16, min=1, max=4096,
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+    irradiance_show_preview: bpy.props.BoolProperty(
+        name="Show Irradiance Probes",
+        description="Preview irradiance probe positions as green dots",
+        default=False,
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+
+    # Envmap probes
+    envmap_probe_count: bpy.props.IntProperty(
+        name="Envmap Probes",
+        description="Number of environment map probes to place (1-128)",
+        default=16, min=1, max=128,
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+    envmap_show_preview: bpy.props.BoolProperty(
+        name="Show Envmap Probes",
+        description="Preview envmap probe positions as green dots",
+        default=False,
+        update=lambda self, ctx: mark_probe_preview_dirty(),
+    )
+    envmap_probe_resolution: bpy.props.IntProperty(
+        name="Probe Resolution",
+        description="Resolution of each equirectangular probe (width)",
+        default=512, min=128, max=1024, step=128,
+    )
+
+    ui_bake_expanded: bpy.props.BoolProperty(default=True,
+        description="Toggle bake section")
+
 
 # ---------------------------------------------------------------------------
 # Register / unregister
@@ -705,6 +935,27 @@ def register():
     bpy.types.Scene.splatting_properties = bpy.props.PointerProperty(type=SplattingProperties)
     bpy.types.Scene.splatting_instances = bpy.props.CollectionProperty(type=SplattingInstanceItem)
     bpy.types.Object.probe_points = bpy.props.CollectionProperty(type=ProbePoint)
+    bpy.types.Object.bake_bbox_corners = bpy.props.FloatVectorProperty(
+        name="Bake BBox Corners",
+        description="8 local-space corners of the bake bounding box (24 floats)",
+        default=(0.0,) * 24,
+        size=24,
+    )
+    bpy.types.Object.bake_matrix_world = bpy.props.FloatVectorProperty(
+        name="Bake Matrix World",
+        description="Object's matrix_world at bake time (16 floats row-major)",
+        default=(1.0, 0.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0, 0.0,
+                 0.0, 0.0, 1.0, 0.0,
+                 0.0, 0.0, 0.0, 1.0),
+        size=16,
+    )
+
+    bpy.types.Object.envmap_atlas = bpy.props.StringProperty(
+        name="Envmap Atlas",
+        description="Name of the envmap atlas image for this object",
+        default="",
+    )
 
     # Subscribe to Object name changes
     bpy.msgbus.subscribe_rna(
@@ -755,6 +1006,12 @@ def unregister():
     bpy.utils.unregister_class(SplattingInstanceItem)
     if hasattr(bpy.types.Object, "probe_points"):
         del bpy.types.Object.probe_points
+    if hasattr(bpy.types.Object, "bake_bbox_corners"):
+        del bpy.types.Object.bake_bbox_corners
+    if hasattr(bpy.types.Object, "bake_matrix_world"):
+        del bpy.types.Object.bake_matrix_world
+    if hasattr(bpy.types.Object, "envmap_atlas"):
+        del bpy.types.Object.envmap_atlas
     bpy.utils.unregister_class(ProbePoint)
     if hasattr(bpy.types.Scene, "splatting_properties"):
         del bpy.types.Scene.splatting_properties
@@ -1151,6 +1408,8 @@ def start_render(context):
     _tag_view3d_redraw()
 
     # --- Irradiance probe interpolation setup ---
+    global _irradiance_objects_dirty
+    _irradiance_objects_dirty = True
     collect_irradiance_objects()
     _refresh_probe_cache()
     global _irradiance_pre_handle, _irradiance_update_idx
@@ -1255,9 +1514,12 @@ def _sort_blocks(inst, cp_np, block_range):
 def sort_blocks_far_to_near(camera_pos):
     """Sort all instances' blocks far-to-near.
 
-    camera_pos is in world space — transformed to each instance's local space.
-    Returns True if any sorting was performed.
+    camera_pos is in world space (Vector or 3-tuple) — transformed to each
+    instance's local space.  Returns True if any sorting was performed.
     """
+    from mathutils import Vector
+    if not isinstance(camera_pos, Vector):
+        camera_pos = Vector(camera_pos)
     global _scene
     if not _scene.instances:
         return False
@@ -1419,4 +1681,6 @@ def _redraw_tick():
                         if area.type == 'VIEW_3D':
                             area.tag_redraw()
             return 1.0 / 24.0
-    return 1.0  # keep running at low freq for window-change detection
+    # No sorting needed, stop the timer
+    _scene._redraw_timer = None
+    return None

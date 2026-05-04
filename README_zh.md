@@ -79,17 +79,6 @@ Fast Splatting 不支持渲染管线导出，因此如果需要导出动画，�
 
 渲染时，面板会显示总块数/泼溅数和已显示的块数/泼溅数。
 
-## 架构
-
-```
-Fast Splatting/
-├── __init__.py           # 插件元数据，注册
-├── operators.py          # Blender 操作符
-├── panels.py             # UI 侧边栏面板，场景属性
-├── splatting_data.py     # 数据加载，空间索引，状态管理，排序
-├── gpu_renderer.py       # GPU 批次构建，GLSL 着色器，绘制循环
-└── blender_manifest.toml # Blender 扩展清单
-```
 
 ## 性能说明
 

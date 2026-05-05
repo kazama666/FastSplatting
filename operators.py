@@ -10,19 +10,12 @@ from bpy import types
 _capture_handler = None
 _capture_requested = False
 _capture_ready = False
-_capture_vp_w = 0
-_capture_vp_h = 0
 
 
 def _post_view_capture():
     global _capture_requested, _capture_ready
-    global _capture_vp_w, _capture_vp_h
     if not _capture_requested:
         return
-    import gpu
-    _, _, w, h = gpu.state.viewport_get()
-    _capture_vp_w = w
-    _capture_vp_h = h
     _capture_requested = False
     _capture_ready = True
 
@@ -103,7 +96,8 @@ def _init_instance_defaults(item, context):
     item.color_gamma = d.default_color_gamma
     item.color_hue = d.default_color_hue
     item.color_saturation = d.default_color_saturation
-    item.quad_scale = d.default_quad_scale
+    item.brightness_gain = d.default_brightness_gain
+    item.brightness_gain_start = d.default_brightness_gain_start
 
 
 class SPLATTING_OT_remove_instance(types.Operator):
@@ -181,42 +175,6 @@ class SPLATTING_OT_toggle_instance(types.Operator):
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
                 break
-        return {'FINISHED'}
-
-
-class SPLATTING_OT_sort_blocks(types.Operator):
-    bl_idname = "splatting.sort_blocks"
-    bl_label = "Sort Blocks Far→Near"
-    bl_description = "Sort splats inside each block by distance from camera (far to near) for correct alpha blending"
-
-    def execute(self, context):
-        camera_pos = None
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                region3d = area.spaces.active.region_3d
-                is_camera_view = region3d.view_perspective == 'CAMERA'
-                if is_camera_view and context.scene.camera:
-                    camera_pos = context.scene.camera.matrix_world.translation
-                else:
-                    camera_pos = region3d.view_matrix.inverted().translation
-                break
-
-        if camera_pos is None:
-            self.report({'WARNING'}, "No 3D viewport found")
-            return {'CANCELLED'}
-
-        from . import splatting_data
-
-        # Reset sort state for all instances
-        scene = splatting_data.get_state()
-        for inst in scene.instances:
-            inst._sort_active = False
-            inst.clear_cache()
-
-        if splatting_data.sort_blocks_far_to_near(camera_pos):
-            self.report({'INFO'}, "Blocks sorted far→near")
-        else:
-            self.report({'WARNING'}, "No splatting data loaded")
         return {'FINISHED'}
 
 
@@ -403,91 +361,6 @@ class SPLATTING_OT_export_animation(bpy.types.Operator):
         _capture_ready = False
 
 
-class SPLATTING_OT_debug_generate(types.Operator):
-    bl_idname = "splatting.debug_generate"
-    bl_label = "Generate Debug Splat"
-    bl_description = "Generate a single-row mesh with debug splat attributes for texture coordinate verification"
-
-    splat_count: bpy.props.IntProperty(
-        default=16, min=2, max=256,
-        description="Number of debug splats to generate",
-    )
-
-    def execute(self, context):
-        import numpy as np
-
-        n = self.splat_count
-
-        # Create mesh: vertices in a row along X, centered at origin
-        mesh = bpy.data.meshes.new("DebugSplats")
-        verts = [(i * 0.5 - (n - 1) * 0.25, 0.0, 0.0) for i in range(n)]
-        mesh.from_pydata(verts, [], [])
-
-        # Add float attributes matching PLY schema
-        for name in ['f_dc_0', 'f_dc_1', 'f_dc_2', 'opacity',
-                      'scale_0', 'scale_1', 'scale_2',
-                      'rot_0', 'rot_1', 'rot_2', 'rot_3']:
-            mesh.attributes.new(name, 'FLOAT', 'POINT')
-
-        # Inverse of: display_color = pow(sigmoid(raw_dc), 2.2)
-        def raw_from_display(r, g, b):
-            eps = 1e-6
-            linear = np.power(np.clip([r, g, b], eps, 1.0 - eps), 1.0 / 2.2)
-            return [float(np.log(c / (1.0 - c))) for c in linear]
-
-        # 8 clearly distinct colors — if sampling is right, pattern is (0,1,2,3,4,5,6,7,0,1,...)
-        palette = [
-            (1.0, 0.0, 0.0),  # 0: Red
-            (0.0, 1.0, 0.0),  # 1: Green
-            (0.0, 0.0, 1.0),  # 2: Blue
-            (1.0, 1.0, 0.0),  # 3: Yellow
-            (0.0, 1.0, 1.0),  # 4: Cyan
-            (1.0, 0.0, 1.0),  # 5: Magenta
-            (1.0, 0.5, 0.0),  # 6: Orange
-            (0.5, 0.0, 1.0),  # 7: Purple
-        ]
-
-        for i in range(n):
-            r, g, b = palette[i % 8]
-            raw = raw_from_display(r, g, b)
-            mesh.attributes["f_dc_0"].data[i].value = raw[0]
-            mesh.attributes["f_dc_1"].data[i].value = raw[1]
-            mesh.attributes["f_dc_2"].data[i].value = raw[2]
-
-            # Opacity: sigmoid → ~0.99
-            mesh.attributes["opacity"].data[i].value = float(np.log(0.99 / 0.01))
-            # Scale: exp → 0.15
-            mesh.attributes["scale_0"].data[i].value = float(np.log(0.15))
-            mesh.attributes["scale_1"].data[i].value = float(np.log(0.15))
-            mesh.attributes["scale_2"].data[i].value = float(np.log(0.15))
-            # Rotation: identity quaternion
-            mesh.attributes["rot_0"].data[i].value = 1.0
-            mesh.attributes["rot_1"].data[i].value = 0.0
-            mesh.attributes["rot_2"].data[i].value = 0.0
-            mesh.attributes["rot_3"].data[i].value = 0.0
-
-        # Create object at 3D cursor, select it
-        obj = bpy.data.objects.new("DebugSplats", mesh)
-        obj.location = context.scene.cursor.location
-        context.collection.objects.link(obj)
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-
-        # Auto-add to splatting instance list
-        for item in context.scene.splatting_instances:
-            if item.mesh_name == obj.name:
-                self.report({'INFO'}, f"Debug mesh '{obj.name}' already in list")
-                return {'FINISHED'}
-        item = context.scene.splatting_instances.add()
-        item.mesh_name = obj.name
-        item.mesh_uid = obj.session_uid
-        item.enabled = True
-        _init_instance_defaults(item, context)
-        context.scene.splatting_properties.active_instance_index = len(context.scene.splatting_instances) - 1
-
-        self.report({'INFO'}, f"Generated debug mesh '{obj.name}' with {n} splats")
-        return {'FINISHED'}
 
 
 class SPLATTING_OT_import_spz(types.Operator):
@@ -626,7 +499,8 @@ class SPLATTING_OT_set_default_render(types.Operator):
         d.default_color_gamma = src.color_gamma
         d.default_color_hue = src.color_hue
         d.default_color_saturation = src.color_saturation
-        d.default_quad_scale = src.quad_scale
+        d.default_brightness_gain = src.brightness_gain
+        d.default_brightness_gain_start = src.brightness_gain_start
         self.report({'INFO'}, "Render adjustments saved as default")
         return {'FINISHED'}
 
@@ -672,14 +546,13 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         positions_h = np.concatenate([positions, ones], axis=1)
         positions_world = (positions_h @ mat.T)[:, :3]
 
-        # Get probe positions from the preview cache (density-based placement)
-        from .splatting_data import get_probe_positions, try_update_probe_preview
-        try_update_probe_preview(context)
-        probe_positions = get_probe_positions('irradiance')
-        if probe_positions is None or len(probe_positions) == 0:
-            self.report({'ERROR'}, "No probe positions — enable Irradiance preview first")
+        # Auto-generate probe positions
+        from .splatting_data import compute_probe_positions
+        irr_positions, _ = compute_probe_positions(context)
+        if irr_positions is None or len(irr_positions) == 0:
+            self.report({'ERROR'}, "No probe positions could be generated")
             return {'CANCELLED'}
-        probe_positions = np.asarray(probe_positions, dtype=np.float32)
+        probe_positions = np.asarray(irr_positions, dtype=np.float32)
         num_probes = len(probe_positions)
 
         # Block-grid dimensions for splat filtering only (not probe placement)
@@ -768,11 +641,27 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
             block_avg = filtered_colors.mean(axis=0)
             print(f"[Splatting Bake] block_avg (all splats) = R={block_avg[0]:.4f}  G={block_avg[1]:.4f}  B={block_avg[2]:.4f}")
 
-        # Use block_avg as the default irradiance fallback for receivers outside grids
+        # Apply the same gain + color adjust to block_avg so the fallback
+        # ambient color matches what the SH probes store.
+        ba = block_avg.copy()
+        gs_ba = item.brightness_gain_start
+        gain_ba = item.brightness_gain
+        t_ba = np.clip((ba - gs_ba) / max(1.0 - gs_ba, 1e-6), 0, 1)
+        ba *= (1.0 + t_ba * t_ba * max(gain_ba - 1.0, 0.0))
+        ba *= np.array(item.color_tint[:3], dtype=np.float32)
+        cosH = np.float32(np.cos(item.color_hue * 3.14159))
+        sinH = np.float32(np.sin(item.color_hue * 3.14159))
+        k_ba = np.array([0.57735, 0.57735, 0.57735], dtype=np.float32)
+        dk_ba = np.dot(ba, k_ba)
+        ba = ba * cosH + np.cross(k_ba, ba) * sinH + k_ba * dk_ba * (1.0 - cosH)
+        lum_ba = np.dot(ba, np.array([0.2126, 0.7152, 0.0722], dtype=np.float32))
+        ba = lum_ba * (1.0 - item.color_saturation) + ba * item.color_saturation
+        ba *= 1.2 * item.color_brightness
+        ba = np.maximum(ba, 0.0) ** (1.0 / max(0.65 * item.color_gamma, 0.001))
         bpy.context.scene.splatting_properties.default_irradiance_color = (
-            float(np.clip(block_avg[0], 0, 1)),
-            float(np.clip(block_avg[1], 0, 1)),
-            float(np.clip(block_avg[2], 0, 1)),
+            float(np.clip(ba[0], 0, 1)),
+            float(np.clip(ba[1], 0, 1)),
+            float(np.clip(ba[2], 0, 1)),
         )
 
         # ------------------------------------------------------------------
@@ -800,7 +689,7 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
 
         context.window_manager.progress_begin(0, num_probes)
         num_stored = 0
-        gain = props.bake_gain
+        gain = item.brightness_gain
         inv_mat = np.linalg.inv(mat)
 
         for pi in range(num_probes):
@@ -841,10 +730,35 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
                       f"mean={sample_colors.mean():.4f}  w min={w.min():.4f} max={w.max():.4f} "
                       f"angular min={angular_weight.min():.4f} dist min={dist_weight.min():.4f}")
 
-            # Inverse tone mapping
-            gs = props.bake_gain_start
-            t = np.clip((sample_colors - gs) / (1.0 - gs), 0, 1)
-            sample_colors *= (1.0 + t * t * (gain - 1.0))
+            # Inverse tone mapping (matching shader forward gain exactly)
+            gs = item.brightness_gain_start
+            t = np.clip((sample_colors - gs) / max(1.0 - gs, 1e-6), 0, 1)
+            sample_colors *= (1.0 + t * t * max(gain - 1.0, 0.0))
+
+            # Color adjust — baked into SH so probe receivers get the
+            # per-instance look without double-processing at render time.
+            # Tint
+            sample_colors *= np.array(item.color_tint[:3], dtype=np.float32)
+
+            # Hue rotation
+            cosH = np.float32(np.cos(item.color_hue * 3.14159))
+            sinH = np.float32(np.sin(item.color_hue * 3.14159))
+            k = np.array([0.57735, 0.57735, 0.57735], dtype=np.float32)
+            dot_k = np.dot(sample_colors, k)
+            sample_colors = (sample_colors * cosH +
+                             np.cross(k, sample_colors) * sinH +
+                             k[np.newaxis, :] * dot_k[:, np.newaxis] * (1.0 - cosH))
+
+            # Saturation
+            lum = np.dot(sample_colors, np.array([0.2126, 0.7152, 0.0722], dtype=np.float32))
+            sample_colors = (lum[:, np.newaxis] * (1.0 - item.color_saturation) +
+                             sample_colors * item.color_saturation)
+
+            # Brightness (1.2x factor matches the shader)
+            sample_colors *= 1.2 * item.color_brightness
+
+            # Gamma
+            sample_colors = np.maximum(sample_colors, 0.0) ** (1.0 / max(0.65 * item.color_gamma, 0.001))
 
             # SH2 projection with uniform directional sampling
             uniform_scale = 4.0 * np.pi / NUM_DIR_SAMPLES
@@ -895,10 +809,10 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
         return {'FINISHED'}
 
 
-class SPLATTING_OT_remove_lightprobe(types.Operator):
-    bl_idname = "splatting.remove_lightprobe"
-    bl_label = "Remove Light Probes"
-    bl_description = "Remove all light probe data from this splat instance"
+class SPLATTING_OT_remove_baked_lighting(types.Operator):
+    bl_idname = "splatting.remove_baked_lighting"
+    bl_label = "Remove Baked Lighting"
+    bl_description = "Remove all baked lighting data (light probes + envmap) from this splat instance"
 
     def execute(self, context):
         props = context.scene.splatting_properties
@@ -914,7 +828,7 @@ class SPLATTING_OT_remove_lightprobe(types.Operator):
             self.report({'ERROR'}, "Instance mesh not found")
             return {'CANCELLED'}
 
-        n = len(obj.probe_points)
+        # Remove light probes
         obj.probe_points.clear()
         obj.bake_bbox_corners = (0.0,) * 24
         bake_mat_default = (1.0, 0.0, 0.0, 0.0,
@@ -922,9 +836,25 @@ class SPLATTING_OT_remove_lightprobe(types.Operator):
                             0.0, 0.0, 1.0, 0.0,
                             0.0, 0.0, 0.0, 1.0)
         obj.bake_matrix_world = bake_mat_default
+
+        # Remove envmap atlas image
+        # Must unlink from node groups first to avoid GPU crash.
+        atlas_name = obj.envmap_atlas
+        if atlas_name:
+            img = bpy.data.images.get(atlas_name)
+            if img:
+                # Unlink from FS_PBR_BRDF EnvImage nodes
+                ng = bpy.data.node_groups.get('FS_PBR_BRDF')
+                if ng:
+                    for node in ng.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image is img:
+                            node.image = None
+                bpy.data.images.remove(img, do_unlink=True)
+            obj.envmap_atlas = ""
+
         from . import splatting_data
         splatting_data.invalidate_irradiance_cache()
-        self.report({'INFO'}, f"Removed {n} light probes from '{obj.name}'")
+        self.report({'INFO'}, f"Removed baked lighting from '{obj.name}'")
         return {'FINISHED'}
 
 
@@ -953,23 +883,21 @@ class SPLATTING_OT_bake_envmap(types.Operator):
             self.report({'ERROR'}, "Instance mesh not found")
             return {'CANCELLED'}
 
-        # Get envmap probe positions
-        from .splatting_data import get_probe_positions, try_update_probe_preview
-        try_update_probe_preview(context)
-        probe_positions = get_probe_positions('envmap')
-        if probe_positions is None or len(probe_positions) == 0:
-            self.report({'ERROR'}, "No envmap probe positions — enable Envmap preview first")
+        # Single envmap probe at bake area center
+        from .splatting_data import compute_probe_positions
+        _, env_positions = compute_probe_positions(context)
+        if env_positions is None or len(env_positions) == 0:
+            self.report({'ERROR'}, "No envmap probe positions could be generated")
             return {'CANCELLED'}
 
         self._obj = obj
-        self._probe_positions = np.asarray(probe_positions, dtype=np.float32)
-        # Bake the first (center-most) probe position only
-        self._probe_pos = self._probe_positions[0]
+        self._item = item  # SplattingInstanceItem with per-mesh brightness props
+        self._probe_pos = env_positions[0]  # center probe
         from .envmap_utils import _FACE_NAMES
         self._face_names = _FACE_NAMES
 
-        self._probe_res = props.envmap_probe_resolution
-        self._probe_w = self._probe_res
+        self._probe_res = 512
+        self._probe_w = 512
 
         # ------------------------------------------------------------------
         # Initialize renderer & load splat data if not already rendering
@@ -1035,11 +963,14 @@ class SPLATTING_OT_bake_envmap(types.Operator):
         self._face_images = {}
         self._phase = 'faces'
         self._face_idx = 0
+        self._convolve_level = 0
+        self._mip_chain = []
         self._fully_sorted = False
         self._offscreen = None
 
         context.window_manager.modal_handler_add(self)
         self._timer = context.window_manager.event_timer_add(0.001, window=context.window)
+        context.window_manager.progress_begin(0, 12)
         return {'RUNNING_MODAL'}
 
     # ------------------------------------------------------------------
@@ -1110,10 +1041,6 @@ class SPLATTING_OT_bake_envmap(types.Operator):
         ones_8 = np.ones((8, 1), dtype=np.float32)
         corners_h = np.concatenate([bbox_local, ones_8], axis=1)
         corners_w = (corners_h @ mat.T)[:, :3]
-        inst._frozen_grid_min = corners_w.min(axis=0).copy()
-        inst._frozen_grid_max = corners_w.max(axis=0).copy()
-        inst._frozen_positions_min = positions_world.min(axis=0).copy()
-        inst._frozen_positions_max = positions_world.max(axis=0).copy()
 
         offset = props.block_offset
         grid_ref = corners_w.min(axis=0)
@@ -1171,8 +1098,8 @@ class SPLATTING_OT_bake_envmap(types.Operator):
 
         if self._phase == 'faces':
             self._render_next_face(context)
-        elif self._phase == 'generate':
-            self._generate_mip_chain(context)
+        elif self._phase == 'convolve':
+            self._convolve_next_level(context)
         elif self._phase == 'pack':
             self._pack_and_store(context)
             self._cleanup(context)
@@ -1210,28 +1137,35 @@ class SPLATTING_OT_bake_envmap(types.Operator):
                 vm, self._proj_matrix,
                 camera_pos_world,
                 skip_sort=self._fully_sorted,
+                skip_inverse_gain=True,
             )
             self._face_images[name] = pixels
 
         self._fully_sorted = True
         self._face_idx += 1
+        context.window_manager.progress_update(self._face_idx)
 
         if self._face_idx >= 6:
-            self._phase = 'generate'
+            self._offscreen.free()
+            self._offscreen = None
+            self._phase = 'convolve'
 
     # ------------------------------------------------------------------
-    # Phase B+C: Generate mip chain from cubemap faces
+    # Phase B: Per-level specular convolution (one level per tick)
     # ------------------------------------------------------------------
-    def _generate_mip_chain(self, context):
-        from .envmap_utils import generate_specular_mip_chain
+    def _convolve_next_level(self, context):
+        from .envmap_utils import convolve_specular_level
 
-        self._offscreen.free()
-        self._offscreen = None
+        level = self._convolve_level
+        eq = convolve_specular_level(level, 6, self._face_images, self._probe_w, 256)
+        self._mip_chain.append(eq)
 
-        self._mip_chain = generate_specular_mip_chain(
-            self._face_images, self._probe_w, levels=6, samples_per_pixel=256)
-        self._face_images = None
-        self._phase = 'pack'
+        self._convolve_level += 1
+        context.window_manager.progress_update(6 + self._convolve_level)
+
+        if self._convolve_level >= 6:
+            self._face_images = None
+            self._phase = 'pack'
 
     # ------------------------------------------------------------------
     # Phase D: Pack atlas & store
@@ -1276,6 +1210,7 @@ class SPLATTING_OT_bake_envmap(types.Operator):
     # cleanup
     # ------------------------------------------------------------------
     def _cleanup(self, context):
+        context.window_manager.progress_end()
         if self._offscreen is not None:
             self._offscreen.free()
             self._offscreen = None
@@ -1297,13 +1232,11 @@ _operators = [
     SPLATTING_OT_remove_instance,
     SPLATTING_OT_move_instance,
     SPLATTING_OT_toggle_instance,
-    SPLATTING_OT_sort_blocks,
     SPLATTING_OT_export_animation,
-    SPLATTING_OT_debug_generate,
     SPLATTING_OT_import_spz,
     SPLATTING_OT_set_default_render,
     SPLATTING_OT_bake_lightprobe,
-    SPLATTING_OT_remove_lightprobe,
+    SPLATTING_OT_remove_baked_lighting,
     SPLATTING_OT_bake_envmap,
 ]
 

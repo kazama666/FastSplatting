@@ -1,7 +1,7 @@
 import bpy
 import gpu
 import numpy as np
-from gpu.types import GPUUniformBuf, GPUVertBuf, GPUVertFormat, GPUBatch
+from gpu.types import GPUUniformBuf, GPUVertBuf, GPUVertFormat, GPUBatch, GPUIndexBuf
 from gpu import state
 from mathutils import Matrix
 
@@ -39,6 +39,12 @@ vec3 computeCov2D(vec4 pos_view, float focal, mat3 cov3d_in, mat3 view_rot) {
 _COLOR_ADJUST_SOURCE = """
     v_opacity = min(inst_opacity * 2.0, 1.0);
 
+    // Forward brightness gain (pre-color-adjust pseudo-HDR expansion)
+    {
+        vec3 t = clamp((v_color - u_BrightnessGainStart) / max(1.0 - u_BrightnessGainStart, 1e-6), 0.0, 1.0);
+        v_color *= (1.0 + t * t * max(u_BrightnessGain - 1.0, 0.0));
+    }
+
     // User color adjustments
     v_color *= u_Tint;
     {
@@ -53,6 +59,15 @@ _COLOR_ADJUST_SOURCE = """
         v_color *= 1.2*u_Brightness;
 
         v_color = pow(max(v_color, vec3(0.0)), vec3(1.0 / (0.65*u_Gamma)));
+    }
+
+    // Inverse brightness gain (luminance-only, post-color-adjust)
+    // Restores relative bright/dark separation without amplifying saturation.
+    // Skipped when u_ApplyInverseGain == 0 (e.g. during envmap offscreen bake)
+    if (u_ApplyInverseGain > 0.5) {
+        float l = dot(v_color, vec3(0.2126, 0.7152, 0.0722));
+        float tl = clamp((l - u_BrightnessGainStart) / max(1.0 - u_BrightnessGainStart, 1e-6), 0.0, 1.0);
+        v_color *= (1.0 + tl * tl * max(u_BrightnessGain - 1.0, 0.0));
     }
 """
 
@@ -103,7 +118,7 @@ _RENDER_SOURCE = """
     qx = min(qx, 512.0);
     qy = min(qy, 512.0);
 
-    vec2 quad_ndc = vec2(qx, qy) / u_ViewportSize * 2.0 * u_QuadScale;
+    vec2 quad_ndc = vec2(qx, qy) / u_ViewportSize * 2.0 * 1.0;
     pos_clip.xyz = pos_clip.xyz / pos_clip.w;
     pos_clip.xy += quad_coord * quad_ndc;
     pos_clip.w = 1.0;
@@ -199,7 +214,7 @@ _ORTHO_RENDER_SOURCE = """
     qx = min(qx, 512.0);
     qy = min(qy, 512.0);
 
-    vec2 quad_ndc = vec2(qx, qy) / u_ViewportSize * 2.0 * u_QuadScale;
+    vec2 quad_ndc = vec2(qx, qy) / u_ViewportSize * 2.0 * 1.0;
     // Ortho: pos_clip is already in NDC (w = 1.0)
     pos_clip.xy += quad_coord * quad_ndc;
 
@@ -249,11 +264,13 @@ def _build_shader(vert_out, with_sh, ortho=False):
     # Push constants (shared)
     info.push_constant('VEC2', "u_FocalParams")
     info.push_constant('VEC2', "u_ViewportSize")
-    info.push_constant('FLOAT', "u_QuadScale")
     info.push_constant('FLOAT', "u_Gamma")
     info.push_constant('FLOAT', "u_Hue")
     info.push_constant('FLOAT', "u_Saturation")
     info.push_constant('FLOAT', "u_Brightness")
+    info.push_constant('FLOAT', "u_BrightnessGain")
+    info.push_constant('FLOAT', "u_BrightnessGainStart")
+    info.push_constant('FLOAT', "u_ApplyInverseGain")
     info.push_constant('VEC3', "u_Tint")
 
     if with_sh:
@@ -295,6 +312,7 @@ class SplattingRenderer:
         self.shader_full_ortho = None
         self.initialized = False
         self._matrices_ubo = None
+        self._skip_inverse_gain = False  # set by draw_offscreen for envmap bake
 
     def init_buffers(self):
         """Create both shaders and shared UBO."""
@@ -347,11 +365,13 @@ class SplattingRenderer:
 
     def _bind_instance_uniforms(self, shader, data, is_sh):
         """Set per-instance uniforms common to both shader variants."""
-        shader.uniform_float("u_QuadScale", data['ui'].quad_scale)
         shader.uniform_float("u_Gamma", data['ui'].color_gamma)
         shader.uniform_float("u_Hue", data['ui'].color_hue)
         shader.uniform_float("u_Saturation", data['ui'].color_saturation)
         shader.uniform_float("u_Brightness", data['ui'].color_brightness)
+        shader.uniform_float("u_BrightnessGain", data['ui'].brightness_gain)
+        shader.uniform_float("u_BrightnessGainStart", data['ui'].brightness_gain_start)
+        shader.uniform_float("u_ApplyInverseGain", 0.0 if self._skip_inverse_gain else 1.0)
         shader.uniform_float("u_Tint", data['ui'].color_tint)
 
         self._update_matrices_ubo(data['vp'], data['view'])
@@ -417,7 +437,6 @@ class SplattingRenderer:
             # Camera positions for auto-sort
             inst._camera_pos_np = np.array(
                 [camera_pos_local[0], camera_pos_local[1], camera_pos_local[2]], dtype=np.float32)
-            inst._camera_world_np = camera_world_np
             inst._vp_world = vp_matrix
             inst._proj_00 = proj_00
             inst._proj_11 = proj_11
@@ -621,13 +640,18 @@ class SplattingRenderer:
 
     def draw_offscreen(self, context, width, height,
                        view_matrix, proj_matrix,
-                       camera_pos_world, skip_sort=False):
+                       camera_pos_world, skip_sort=False, skip_inverse_gain=True):
         """Render to the currently-bound off-screen framebuffer and return pixels.
 
         Performs a full sort before rendering (blocks sorted far-to-near from
         the given camera position), unless ``skip_sort`` is True (caller has
         already sorted).  Returns a (height, width, 4) float32 numpy array
         in RGBA.
+
+        When *skip_inverse_gain* is True (default, used for envmap baking) the
+        inverse gain pass is skipped — forward gain still runs so the cubemap
+        faces have expanded dynamic range, but the post-color-adjust inverse
+        pass is not needed since there's no color-adjust in the bake path.
 
         The caller must bind a GPUOffScreen before calling this method.
         """
@@ -647,16 +671,17 @@ class SplattingRenderer:
                 camera_pos_world[0], camera_pos_world[1], camera_pos_world[2]
             ))
 
+        self._skip_inverse_gain = skip_inverse_gain
         self._render_to_framebuffer(
             context, width, height,
             view_matrix, proj_matrix,
             camera_pos_world, is_ortho=False,
         )
+        self._skip_inverse_gain = False
 
-        buffer = fb.read_color(0, 0, width, height, 4, 0, 'UBYTE')
+        buffer = fb.read_color(0, 0, width, height, 4, 0, 'FLOAT')
         buffer.dimensions = width * height * 4
-        arr = np.asarray(buffer, dtype=np.uint8).reshape(height, width, 4)
-        pixels = arr.astype(np.float32) / 255.0
+        pixels = np.asarray(buffer, dtype=np.float32).reshape(height, width, 4)
 
         state.blend_set('NONE')
         return pixels
@@ -735,7 +760,89 @@ def _aabb_wireframe(lo, hi=None):
 
 _grid_draw_handle = None
 _round_point_shader = None
+_sh_sphere_shader = None
 
+
+def _get_sh_sphere_shader():
+    """Lazy-create custom shader: 9 vec3 SH uniforms, sigmoid reconstruction."""
+    global _sh_sphere_shader
+    if _sh_sphere_shader is not None:
+        return _sh_sphere_shader
+    info = gpu.types.GPUShaderCreateInfo()
+    info.vertex_in(0, 'VEC3', "pos")
+    info.push_constant('MAT4', "u_mvp")
+    info.push_constant('MAT4', "u_model")
+    for i in range(9):
+        info.push_constant('VEC3', f"u_sh_{i}")
+    vert_out = gpu.types.GPUStageInterfaceInfo("sh_sphere_iface")
+    vert_out.smooth('VEC4', "v_color")
+    info.vertex_out(vert_out)
+    info.vertex_source("""
+    vec3 eval_sh(vec3 n) {
+        float x = n.x, y = n.y, z = n.z;
+        return u_sh_0 * 0.282095
+            + u_sh_1 * (0.488603 * y) + u_sh_2 * (0.488603 * z) + u_sh_3 * (0.488603 * x)
+            + u_sh_4 * (1.092548 * x * y) + u_sh_5 * (1.092548 * y * z)
+            + u_sh_6 * (0.315392 * (3.0*z*z - 1.0))
+            + u_sh_7 * (1.092548 * x * z)
+            + u_sh_8 * (0.546274 * (x*x - y*y));
+    }
+    void main() {
+        vec3 world_n = normalize(mat3(u_model) * normalize(pos));
+        vec3 raw = eval_sh(world_n);
+        v_color = vec4(clamp(raw/3.14, 0.0, 1.0), 1.0);
+        v_color = pow(v_color, 1.2);
+        gl_Position = u_mvp * u_model * vec4(pos, 1.0);
+    }
+    """)
+    info.fragment_out(0, 'VEC4', "FragColor")
+    info.fragment_source("void main() { FragColor = v_color; }")
+    _sh_sphere_shader = gpu.shader.create_from_info(info)
+    return _sh_sphere_shader
+
+
+
+_envmap_shader = None
+
+
+def _get_envmap_shader():
+    """Lazy-create shader: reflective sphere sampling equirect envmap atlas."""
+    global _envmap_shader
+    if _envmap_shader is not None:
+        return _envmap_shader
+    info = gpu.types.GPUShaderCreateInfo()
+    info.vertex_in(0, 'VEC3', "pos")
+    info.push_constant('MAT4', "u_mvp")
+    info.push_constant('MAT4', "u_model")
+    info.push_constant('VEC3', "u_cam_pos")
+    info.sampler(0, 'FLOAT_2D', "u_envmap")
+    vert_out = gpu.types.GPUStageInterfaceInfo("envmap_iface")
+    vert_out.smooth('VEC3', "v_refl")
+    info.vertex_out(vert_out)
+    info.vertex_source("""
+    void main() {
+        vec3 world_pos = (u_model * vec4(pos, 1.0)).xyz;
+        vec3 world_norm = normalize(mat3(u_model) * normalize(pos));
+        vec3 view_dir = normalize(u_cam_pos - world_pos);
+        v_refl = reflect(-view_dir, world_norm);
+        gl_Position = u_mvp * u_model * vec4(pos, 1.0);
+    }
+    """)
+    info.fragment_out(0, 'VEC4', "FragColor")
+    info.fragment_source("""
+    void main() {
+        vec3 d = normalize(v_refl);
+        float lon = atan(d.x, d.y);
+        float lat = asin(clamp(d.z, -1.0, 1.0));
+        vec2 uv = vec2(0.5 + 0.5 * lon / 3.14159, 0.5 - lat / 3.14159);
+        uv.y = 1.0 - uv.y;
+        uv.y = uv.y*256.0/504.0;
+                         
+        FragColor = texture(u_envmap, uv);
+    }
+    """)
+    _envmap_shader = gpu.shader.create_from_info(info)
+    return _envmap_shader
 
 
 def _get_round_point_shader():
@@ -782,53 +889,7 @@ def _grid_draw():
     _all_world_verts = []
     _all_baked_probe_verts = []  # baked probe markers
 
-    if props.show_block_grid and _ss.is_rendering and _ss.instances:
-        # During rendering: compute grid in frozen world space (same as
-        # pre-render), then delta-transform each vertex by the current
-        # matrix_world so the grid follows the object transform exactly.
-        for inst in _ss.instances:
-            if inst._frozen_grid_min is None:
-                continue
-            try:
-                mat = np.array(inst.target_mesh.matrix_world, dtype=np.float32)
-            except ReferenceError:
-                continue
-            delta = mat @ inst._orig_model_inv
-
-            lo = inst._frozen_grid_min
-            hi = inst._frozen_grid_max
-            origin = lo + offset
-            bs = block_size
-
-            xs = _steps(origin[0], origin[0] + int(np.ceil((hi[0] - origin[0]) / bs)) * bs, bs)
-            ys = _steps(origin[1], origin[1] + int(np.ceil((hi[1] - origin[1]) / bs)) * bs, bs)
-            zs = _steps(origin[2], origin[2] + int(np.ceil((hi[2] - origin[2]) / bs)) * bs, bs)
-
-            if len(xs) >= 2 or len(ys) >= 2 or len(zs) >= 2:
-                x_min, x_max = xs[0], xs[-1]
-                y_min, y_max = ys[0], ys[-1]
-                z_min, z_max = zs[0], zs[-1]
-
-                lines = []
-                for y in ys:
-                    for z in zs:
-                        lines.append([x_min, y, z])
-                        lines.append([x_max, y, z])
-                for x in xs:
-                    for z in zs:
-                        lines.append([x, y_min, z])
-                        lines.append([x, y_max, z])
-                for x in xs:
-                    for y in ys:
-                        lines.append([x, y, z_min])
-                        lines.append([x, y, z_max])
-
-                if lines:
-                    local_h = np.concatenate([np.array(lines, dtype=np.float32),
-                                              np.ones((len(lines), 1), dtype=np.float32)], axis=1)
-                    _all_world_verts.append((local_h @ delta.T)[:, :3])
-
-    elif props.show_block_grid:
+    if props.show_block_grid and not _ss.is_rendering:
         # Before rendering: world-space AABB from object bound_box × matrix_world.
         items = scene.splatting_instances
 
@@ -899,9 +960,10 @@ def _grid_draw():
             pts_world = (np.concatenate([pts_local, ones], axis=1) @ mat.T)[:, :3]
             _all_baked_probe_verts.append(pts_world)
 
-        if not _all_world_verts and not _all_baked_probe_verts:
-            if not props.irradiance_show_preview and not props.envmap_show_preview:
-                return
+    # Early exit if nothing to draw and preview is off
+    if not _all_world_verts and not _all_baked_probe_verts:
+        if not props.show_bake_preview:
+            return
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     gpu.state.depth_test_set('ALWAYS')
@@ -922,63 +984,111 @@ def _grid_draw():
         shader.uniform_float("color", color)
         batch.draw(shader)
 
-    # Baked probe markers + saved bbox wireframes (toggle-controlled)
-    if props.irradiance_show_preview and _all_baked_probe_verts:
-        # Collect bbox wireframes for baked instances
-        _baked_aabb_verts = []
+    # ---- show_bake_preview controls all probe/bake visualization ----
+    if not props.show_bake_preview:
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('LESS')
+        return
+
+    # ------------------------------------------------------------------
+    # Compute MVP / view matrix (shared by all preview types)
+    # ------------------------------------------------------------------
+    mvp = Matrix.Identity(4)
+    view_matrix = None
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            r3d = area.spaces.active.region_3d
+            mvp = r3d.window_matrix @ r3d.view_matrix
+            view_matrix = r3d.view_matrix
+            break
+
+    # ------------------------------------------------------------------
+    # Baked SH probe spheres (when light probes exist)
+    # ------------------------------------------------------------------
+    if _all_baked_probe_verts and view_matrix is not None:
+        segs_s, rings_s = 16, 8
+        s_verts = []
+        s_verts.append([0.0, 0.0, 1.0])
+        for i in range(1, rings_s):
+            theta = i * np.pi / rings_s
+            for j in range(segs_s):
+                phi = j * 2.0 * np.pi / segs_s
+                x = np.sin(theta) * np.cos(phi)
+                y = np.sin(theta) * np.sin(phi)
+                z = np.cos(theta)
+                s_verts.append([x, y, z])
+        s_verts.append([0.0, 0.0, -1.0])
+        unit_verts = np.array(s_verts, dtype=np.float32)
+
+        s_idx = []
+        for j in range(segs_s):
+            a, b = 1 + j, 1 + (j + 1) % segs_s
+            s_idx.extend([0, b, a])
+        for i in range(rings_s - 2):
+            for j in range(segs_s):
+                a = 1 + i * segs_s + j
+                b = 1 + i * segs_s + (j + 1) % segs_s
+                c = 1 + (i + 1) * segs_s + j
+                d = 1 + (i + 1) * segs_s + (j + 1) % segs_s
+                s_idx.extend([a, b, c])
+                s_idx.extend([b, d, c])
+        last_pole = 1 + (rings_s - 1) * segs_s
+        for j in range(segs_s):
+            a = 1 + (rings_s - 2) * segs_s + j
+            b = 1 + (rings_s - 2) * segs_s + (j + 1) % segs_s
+            s_idx.extend([a, b, last_pole])
+        sphere_indices = np.array(s_idx, dtype=np.int32)
+        sphere_ibo = GPUIndexBuf(type='TRIS', seq=sphere_indices)
+
+        sphere_scale = 0.075
+        sphere_shader = _get_sh_sphere_shader()
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('LESS')
+        gpu.state.depth_mask_set(True)
+        gpu.state.face_culling_set('FRONT')
+
+        fmt_pos = GPUVertFormat()
+        fmt_pos.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+        pos_vbo = GPUVertBuf(fmt_pos, len(unit_verts))
+        pos_vbo.attr_fill(id="pos", data=unit_verts)
+
         for item in scene.splatting_instances:
             if not item.enabled:
                 continue
             obj = bpy.data.objects.get(item.mesh_name)
-            if obj and obj.type == 'MESH' and len(obj.probe_points) > 0:
-                corners = np.array(obj.bake_bbox_corners, dtype=np.float32).reshape(8, 3)
-            if np.any(corners):
-                # 12 edges from 8 corners (index pairs)
-                edges = [0,1, 1,2, 2,3, 3,0, 4,5, 5,6, 6,7, 7,4, 0,4, 1,5, 2,6, 3,7]
-                box_pts = corners[edges].reshape(-1, 3)
-                mat = np.array(obj.matrix_world, dtype=np.float32)
-                ones = np.ones((len(box_pts), 1), dtype=np.float32)
-                _baked_aabb_verts.append(
-                    (np.concatenate([box_pts, ones], axis=1) @ mat.T)[:, :3])
+            if not obj or obj.type != 'MESH' or len(obj.probe_points) == 0:
+                continue
+            mat = np.array(obj.matrix_world, dtype=np.float32)
+            rot_mat = mat[:3, :3]
 
-        # Compute MVP matrix from the 3D viewport
-        mvp = Matrix.Identity(4)
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                r3d = area.spaces.active.region_3d
-                mvp = r3d.window_matrix @ r3d.view_matrix
-                break
+            for pt in obj.probe_points:
+                lp = np.array(pt.location, dtype=np.float32)
+                wp = rot_mat @ lp + mat[:3, 3]
 
-        # Draw baked bbox wireframes
-        if _baked_aabb_verts:
-            bbox_all = np.concatenate(_baked_aabb_verts, axis=0)
-            bbox_fmt = GPUVertFormat()
-            bbox_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-            bbox_vbo = GPUVertBuf(bbox_fmt, len(bbox_all))
-            bbox_vbo.attr_fill(id="pos", data=bbox_all)
-            bbox_batch = GPUBatch(type='LINES', buf=bbox_vbo)
-            shader.bind()
-            shader.uniform_float("color", (0.0, 0.8, 0.3, 0.6))
-            bbox_batch.draw(shader)
+                model = np.eye(4, dtype=np.float32)
+                model[:3, :3] = rot_mat * sphere_scale
+                model[:3, 3] = wp
 
-        # Draw baked probe dots
-        probe_all = np.concatenate(_all_baked_probe_verts, axis=0)
-        probe_fmt = GPUVertFormat()
-        probe_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        probe_vbo = GPUVertBuf(probe_fmt, len(probe_all))
-        probe_vbo.attr_fill(id="pos", data=probe_all)
-        probe_batch = GPUBatch(type='POINTS', buf=probe_vbo)
-        round_shader = _get_round_point_shader()
-        round_shader.bind()
-        round_shader.uniform_float("u_mvp", mvp)
-        round_shader.uniform_float("u_color", (0.0, 1.0, 0.0, 0.8))
-        gpu.state.point_size_set(16)
-        probe_batch.draw(round_shader)
-        gpu.state.point_size_set(1)
+                sh_r = np.array(pt.sh_r[:], dtype=np.float32)
+                sh_g = np.array(pt.sh_g[:], dtype=np.float32)
+                sh_b = np.array(pt.sh_b[:], dtype=np.float32)
 
-    # Probe previews (auto-placed positions, not yet baked)
-    # Draw the bake area bounding box if any auto-placed preview is active
-    if (props.irradiance_show_preview and not _all_baked_probe_verts) or props.envmap_show_preview:
+                batch = GPUBatch(type='TRIS', buf=pos_vbo, elem=sphere_ibo)
+                sphere_shader.bind()
+                sphere_shader.uniform_float("u_mvp", mvp)
+                sphere_shader.uniform_float("u_model", model.T.ravel().tolist())
+                for i in range(9):
+                    sphere_shader.uniform_float(f"u_sh_{i}",
+                        (float(sh_r[i]), float(sh_g[i]), float(sh_b[i])))
+                batch.draw(sphere_shader)
+
+        gpu.state.depth_mask_set(False)
+        gpu.state.depth_test_set('ALWAYS')
+
+    # ------------------------------------------------------------------
+    # Bake area bounding box (only when no baked probes)
+    # ------------------------------------------------------------------
+    if not _all_baked_probe_verts:
         center = np.array(props.bake_area_center, dtype=np.float32)
         half = np.array(props.bake_area_size, dtype=np.float32) * 0.5
         bb_lo = center - half
@@ -993,46 +1103,123 @@ def _grid_draw():
         shader.uniform_float("color", (1.0, 0.6, 0.0, 0.5))
         bbox_batch.draw(shader)
 
-    _probe_drawn = False
-    for probe_type, show_prop, color, psize in [
-        ('irradiance', props.irradiance_show_preview, (0.2, 0.8, 0.2, 0.9), 14),
-        ('envmap', props.envmap_show_preview, (0.2, 0.4, 1.0, 0.9), 28),
-    ]:
-        if not show_prop:
-            continue
-        # Skip auto-placed irradiance preview if active instance already has baked data
-        if probe_type == 'irradiance' and _all_baked_probe_verts:
-            continue
-        from .splatting_data import try_update_probe_preview, get_probe_positions
-        try_update_probe_preview(context)
-        pos = get_probe_positions(probe_type)
-        if pos is not None and len(pos) > 0:
-            if not _probe_drawn:
-                try:
-                    _mvp = mvp
-                except NameError:
-                    _mvp = Matrix.Identity(4)
-                    for area in context.screen.areas:
-                        if area.type == 'VIEW_3D':
-                            r3d = area.spaces.active.region_3d
-                            _mvp = r3d.window_matrix @ r3d.view_matrix
-                            break
-                _probe_drawn = True
+    # ------------------------------------------------------------------
+    # Auto-placed probe previews
+    # ------------------------------------------------------------------
+    from .splatting_data import try_update_probe_preview, get_probe_positions
+    try_update_probe_preview(context)
+
+    # Green dots — irradiance preview (only when no baked light probes)
+    if not _all_baked_probe_verts:
+        irradiance_pos = get_probe_positions('irradiance')
+        if irradiance_pos is not None and len(irradiance_pos) > 0:
             fmt = GPUVertFormat()
             fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-            vbo = GPUVertBuf(fmt, len(pos))
-            vbo.attr_fill(id="pos", data=np.asarray(pos, dtype=np.float32))
+            vbo = GPUVertBuf(fmt, len(irradiance_pos))
+            vbo.attr_fill(id="pos", data=np.asarray(irradiance_pos, dtype=np.float32))
             batch = GPUBatch(type='POINTS', buf=vbo)
-            round_shader = _get_round_point_shader()
-            round_shader.bind()
-            round_shader.uniform_float("u_mvp", _mvp)
-            round_shader.uniform_float("u_color", color)
-            gpu.state.point_size_set(psize)
-            batch.draw(round_shader)
-            gpu.state.point_size_set(1)
+            rs = _get_round_point_shader()
+            rs.bind()
+            rs.uniform_float("u_mvp", mvp)
+            rs.uniform_float("u_color", (0.2, 0.8, 0.2, 0.9))
+            gpu.state.point_size_set(14)
+            batch.draw(rs)
+
+    # Blue dot — envmap center (only when no baked envmap atlas exists)
+    has_envmap = any(
+        getattr(bpy.data.objects.get(item.mesh_name), 'envmap_atlas', '')
+        for item in scene.splatting_instances if item.enabled
+    )
+    if not has_envmap:
+        envmap_pos = get_probe_positions('envmap')
+        if envmap_pos is not None and len(envmap_pos) > 0:
+            fmt = GPUVertFormat()
+            fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            vbo = GPUVertBuf(fmt, len(envmap_pos))
+            vbo.attr_fill(id="pos", data=np.asarray(envmap_pos, dtype=np.float32))
+            batch = GPUBatch(type='POINTS', buf=vbo)
+            rs = _get_round_point_shader()
+            rs.bind()
+            rs.uniform_float("u_mvp", mvp)
+            rs.uniform_float("u_color", (0.2, 0.4, 1.0, 0.9))
+            gpu.state.point_size_set(28)
+            gpu.state.depth_test_set('LESS')
+            gpu.state.depth_mask_set(True)
+            batch.draw(rs)
+
+    gpu.state.point_size_set(1)
+
+    # ------------------------------------------------------------------
+    # Envmap reflection sphere (if any instance has an envmap atlas)
+    # ------------------------------------------------------------------
+    envmap_img_name = None
+    for item in scene.splatting_instances:
+        if not item.enabled:
+            continue
+        obj = bpy.data.objects.get(item.mesh_name)
+        if obj and obj.type == 'MESH' and getattr(obj, 'envmap_atlas', ''):
+            envmap_img_name = obj.envmap_atlas
+            break
+    if envmap_img_name and view_matrix is not None:
+        env_segs, env_rings = 32, 16
+        ev = [[0.0, 0.0, 1.0]]
+        for i in range(1, env_rings):
+            theta = i * np.pi / env_rings
+            for j in range(env_segs):
+                phi = j * 2.0 * np.pi / env_segs
+                ev.append([np.sin(theta) * np.cos(phi),
+                           np.sin(theta) * np.sin(phi),
+                           np.cos(theta)])
+        ev.append([0.0, 0.0, -1.0])
+        env_unit_verts = np.array(ev, dtype=np.float32)
+
+        ei = []
+        for j in range(env_segs):
+            a, b = 1 + j, 1 + (j + 1) % env_segs
+            ei.extend([0, b, a])
+        for i in range(env_rings - 2):
+            for j in range(env_segs):
+                a = 1 + i * env_segs + j
+                b = 1 + i * env_segs + (j + 1) % env_segs
+                c = 1 + (i + 1) * env_segs + j
+                d = 1 + (i + 1) * env_segs + (j + 1) % env_segs
+                ei.extend([a, b, c])
+                ei.extend([b, d, c])
+        last_pole = 1 + (env_rings - 1) * env_segs
+        for j in range(env_segs):
+            a = 1 + (env_rings - 2) * env_segs + j
+            b = 1 + (env_rings - 2) * env_segs + (j + 1) % env_segs
+            ei.extend([b, a, last_pole])
+        env_ibo = GPUIndexBuf(type='TRIS', seq=np.array(ei, dtype=np.int32))
+        env_fmt = GPUVertFormat()
+        env_fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+        env_vbo = GPUVertBuf(env_fmt, len(env_unit_verts))
+        env_vbo.attr_fill(id="pos", data=env_unit_verts)
+        env_sphere_scale = 0.3  # 4x of SH sphere scale (0.075)
+
+        img = bpy.data.images.get(envmap_img_name)
+        if img:
+            tex = gpu.texture.from_image(img)
+            cam_pos = view_matrix.inverted().translation
+            center_wp = np.array(props.bake_area_center, dtype=np.float32)
+            env_model = np.eye(4, dtype=np.float32)
+            env_model[:3, :3] = np.eye(3, dtype=np.float32) * env_sphere_scale
+            env_model[:3, 3] = center_wp
+            env_shader = _get_envmap_shader()
+            env_shader.bind()
+            env_shader.uniform_float("u_mvp", mvp)
+            env_shader.uniform_float("u_model", env_model.T.ravel().tolist())
+            env_shader.uniform_float("u_cam_pos", (cam_pos.x, cam_pos.y, cam_pos.z))
+            env_shader.uniform_sampler("u_envmap", tex)
+            gpu.state.depth_test_set('LESS')
+            gpu.state.depth_mask_set(True)
+            gpu.state.face_culling_set('FRONT')
+            batch = GPUBatch(type='TRIS', buf=env_vbo, elem=env_ibo)
+            batch.draw(env_shader)
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('LESS')
+    gpu.state.face_culling_set('NONE')
 
 
 def register_grid_draw():

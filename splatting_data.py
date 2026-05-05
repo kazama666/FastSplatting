@@ -61,12 +61,6 @@ class SplattingState:
         self._orig_block_bounds = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
-        # Frozen world-space AABB at render start (for grid overlay during rendering)
-        self._frozen_grid_min = None
-        self._frozen_grid_max = None
-        # Tighter AABB from actual splat positions (for blue wireframe)
-        self._frozen_positions_min = None
-        self._frozen_positions_max = None
 
         # GPU batch cache (per-instance)
         self._batch_cache = {}
@@ -105,10 +99,6 @@ class SplattingState:
         self._orig_block_bounds = None
         self._orig_model_matrix = None
         self._orig_model_inv = None
-        self._frozen_grid_min = None
-        self._frozen_grid_max = None
-        self._frozen_positions_min = None
-        self._frozen_positions_max = None
 
     # ------------------------------------------------------------------
     # GPU batch building (moved from gpu_renderer.py)
@@ -315,8 +305,18 @@ class SplattingInstanceItem(types.PropertyGroup):
         description="Hue shift (-1..1)")
     color_saturation: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0, step=0.01,
         description="Saturation (0=gray, 1=original)")
-    quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0,
-        description="Uniform scale multiplier for splat size")
+
+    # Per-instance brightness gain (pseudo-HDR)
+    brightness_gain: bpy.props.FloatProperty(
+        name="Brightness Gain",
+        description="Expand splat color range for pseudo-HDR. Higher values = more dynamic range.",
+        default=1.0, min=1.0, max=10.0, step=0.1,
+    )
+    brightness_gain_start: bpy.props.FloatProperty(
+        name="Gain Start",
+        description="Threshold where non-linear expansion begins. Colors below this stay nearly unchanged.",
+        default=0.5, min=0.0, max=0.95, step=0.01,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +377,6 @@ _probe_last_change_time = 0.0       # time.time() of last param change
 
 def mark_probe_preview_dirty():
     """Called when user changes probe params — records timestamp for debounce."""
-    import time
     global _probe_last_change_time
     _probe_last_change_time = time.time()
 
@@ -392,20 +391,22 @@ def get_probe_positions(probe_type='envmap'):
 def _farthest_point_sample(candidates, n, bb_lo, bb_hi, min_spacing=0.0):
     """Farthest-point sampling from candidate positions.
 
-    Returns (n, 3) float32 array. The first point is always the
-    bounding-box center so that count=1 places a probe at center.
-    Subsequent points are farthest-point-sampled from candidates.
+    For n=1 returns the bounding-box center.
+    For n>=2 uses pure farthest-point on candidates (no center anchoring)
+    so points are evenly distributed through the accessible volume.
     """
     center = (bb_lo + bb_hi) * 0.5
 
     if n <= 1:
         return center.reshape(1, 3)
 
-    k = min(n - 1, len(candidates))  # number of farthest-point candidates to select
-    dists = np.linalg.norm(candidates - center, axis=1)
-    selected = [int(np.argmax(dists))]
+    if len(candidates) == 0:
+        return center.reshape(1, 3)
+
+    k = min(n, len(candidates))
+    selected = [0]  # deterministic seed
     selected_mask = np.zeros(len(candidates), dtype=bool)
-    selected_mask[selected[0]] = True
+    selected_mask[0] = True
 
     min_dists = np.full(len(candidates), np.inf, dtype=np.float32)
     for _ in range(k - 1):
@@ -420,7 +421,7 @@ def _farthest_point_sample(candidates, n, bb_lo, bb_hi, min_spacing=0.0):
         selected.append(next_idx)
         selected_mask[next_idx] = True
 
-    return np.vstack([center.reshape(1, 3), candidates[selected]])
+    return candidates[selected]
 
 
 def compute_probe_positions(context):
@@ -435,12 +436,10 @@ def compute_probe_positions(context):
     Caches both in module-level globals.
     """
     import numpy as np
-    import time
     global _irradiance_probe_positions, _envmap_probe_positions
 
     props = context.scene.splatting_properties
     n_irr = props.irradiance_probe_count
-    n_env = props.envmap_probe_count
 
     # Bake volume from center + size
     center = np.array(props.bake_area_center, dtype=np.float32)
@@ -449,6 +448,9 @@ def compute_probe_positions(context):
     hi = center + half
     dims = np.array(props.bake_area_size, dtype=np.float32)
     dims = np.maximum(dims, 1.0)
+
+    # Envmap always bakes a single probe at the bake area center
+    _envmap_probe_positions = center.reshape(1, 3)
 
     # Collect world-space splat positions from all enabled instances
     all_positions = []
@@ -471,8 +473,7 @@ def compute_probe_positions(context):
 
     if not all_positions:
         _irradiance_probe_positions = None
-        _envmap_probe_positions = None
-        return None, None
+        return None, _envmap_probe_positions
 
     positions = np.concatenate(all_positions, axis=0)
 
@@ -486,8 +487,6 @@ def compute_probe_positions(context):
         # No splats inside bake volume — spread evenly
         _irradiance_probe_positions = _farthest_point_sample(
             _generate_uniform_candidates(lo, hi, 64), n_irr, lo, hi)
-        _envmap_probe_positions = _farthest_point_sample(
-            _generate_uniform_candidates(lo, hi, 64), n_env, lo, hi)
         return _irradiance_probe_positions, _envmap_probe_positions
 
     flat_idx = (vox_ij[:, 0] * VOXEL_RES * VOXEL_RES
@@ -513,25 +512,20 @@ def compute_probe_positions(context):
     cand_density = density_smooth[dv_ij[:, 0], dv_ij[:, 1], dv_ij[:, 2]]
 
     # Keep bottom 30% density (open space)
-    max_n = max(n_irr, n_env)
     threshold = max(np.percentile(cand_density, 30), 1.0)
     keep = cand_density <= threshold
-    if keep.sum() < max_n:
+    if keep.sum() < n_irr:
         threshold = np.percentile(cand_density, 50)
         keep = cand_density <= threshold
-    if keep.sum() < max_n:
+    if keep.sum() < n_irr:
         keep = np.ones(len(candidates), dtype=bool)
 
     candidates = candidates[keep]
     if len(candidates) == 0:
         candidates = _generate_uniform_candidates(lo, hi, 64)
 
-    # Farthest-point for each probe type (always via _farthest_point_sample
-    # so the first point is always the bake-area center)
     _irradiance_probe_positions = _farthest_point_sample(
         candidates, n_irr, lo, hi) if n_irr > 0 else None
-    _envmap_probe_positions = _farthest_point_sample(
-        candidates, n_env, lo, hi) if n_env > 0 else None
 
     return _irradiance_probe_positions, _envmap_probe_positions
 
@@ -554,7 +548,6 @@ def try_update_probe_preview(context):
     has expired, recompute both probe position sets.
     Returns True if positions are available (cached or fresh).
     """
-    import time
     global _probe_last_change_time
     if _probe_last_change_time > 0 and time.time() - _probe_last_change_time >= 1.0:
         _probe_last_change_time = 0.0
@@ -785,18 +778,10 @@ class SplattingProperties(types.PropertyGroup):
         description="Default hue shift for new instances")
     default_color_saturation: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0, step=0.01,
         description="Default saturation for new instances")
-    default_quad_scale: bpy.props.FloatProperty(default=1.0, min=0.0, max=2.0,
-        description="Default splat scale multiplier for new instances")
-    bake_gain: bpy.props.FloatProperty(
-        name="Bake Gain",
-        description="Expand splat color range before baking probes. Higher values = more dynamic range in indirect lighting.",
-        default=3.0, min=1.0, max=10.0, step=0.1,
-    )
-    bake_gain_start: bpy.props.FloatProperty(
-        name="Bake Gain Start",
-        description="Threshold where non-linear expansion begins. Colors below this stay nearly unchanged.",
-        default=0.7, min=0.5, max=0.95, step=0.01,
-    )
+    default_brightness_gain: bpy.props.FloatProperty(default=5.75, min=1.0, max=10.0, step=0.1,
+        description="Default brightness gain for new instances")
+    default_brightness_gain_start: bpy.props.FloatProperty(default=0.5, min=0.0, max=0.95, step=0.01,
+        description="Default brightness gain start for new instances")
     anim_start_frame: bpy.props.IntProperty(default=1,
         description="First frame of animation export range")
     anim_end_frame: bpy.props.IntProperty(default=250,
@@ -814,6 +799,8 @@ class SplattingProperties(types.PropertyGroup):
         description="Toggle export animation section")
     ui_color_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle color adjustment section")
+    ui_brightness_expanded: bpy.props.BoolProperty(default=True,
+        description="Toggle brightness section")
     ui_stats_expanded: bpy.props.BoolProperty(default=True,
         description="Toggle statistics section")
     ui_meshes_expanded: bpy.props.BoolProperty(default=True,
@@ -837,35 +824,16 @@ class SplattingProperties(types.PropertyGroup):
 
     # Irradiance (SH) probes
     irradiance_probe_count: bpy.props.IntProperty(
-        name="Irradiance Probes",
-        description="Number of irradiance (SH) probes to place",
+        name="Probe Count",
+        description="Number of probes to place for baked lighting",
         default=16, min=1, max=4096,
         update=lambda self, ctx: mark_probe_preview_dirty(),
     )
-    irradiance_show_preview: bpy.props.BoolProperty(
-        name="Show Irradiance Probes",
-        description="Preview irradiance probe positions as green dots",
+    show_bake_preview: bpy.props.BoolProperty(
+        name="Show Baked Lighting Preview",
+        description="Preview probe positions and bake area",
         default=False,
         update=lambda self, ctx: mark_probe_preview_dirty(),
-    )
-
-    # Envmap probes
-    envmap_probe_count: bpy.props.IntProperty(
-        name="Envmap Probes",
-        description="Number of environment map probes to place (1-128)",
-        default=16, min=1, max=128,
-        update=lambda self, ctx: mark_probe_preview_dirty(),
-    )
-    envmap_show_preview: bpy.props.BoolProperty(
-        name="Show Envmap Probes",
-        description="Preview envmap probe positions as green dots",
-        default=False,
-        update=lambda self, ctx: mark_probe_preview_dirty(),
-    )
-    envmap_probe_resolution: bpy.props.IntProperty(
-        name="Probe Resolution",
-        description="Resolution of each equirectangular probe (width)",
-        default=512, min=128, max=1024, step=128,
     )
 
     ui_bake_expanded: bpy.props.BoolProperty(default=True,
@@ -1345,10 +1313,6 @@ def start_render(context):
         ones_8 = np.ones((8, 1), dtype=np.float32)
         corners_h = np.concatenate([bbox_local, ones_8], axis=1)
         corners_w = (corners_h @ mat.T)[:, :3]
-        inst._frozen_grid_min = corners_w.min(axis=0).copy()
-        inst._frozen_grid_max = corners_w.max(axis=0).copy()
-        inst._frozen_positions_min = positions_world.min(axis=0).copy()
-        inst._frozen_positions_max = positions_world.max(axis=0).copy()
         offset = splatting_props.block_offset
         # Adjust block offset so blocks share the same spatial origin as the
         # grid (which is based on bound_box AABB).  Without this the block
@@ -1506,7 +1470,6 @@ def _sort_blocks(inst, cp_np, block_range):
             continue
         diff = pos[indices] - cp_np
         dists = np.sum(diff * diff, axis=1)
-        # dists = dists + inst.scales[indices].sum(axis=1)
         order = np.argsort(dists)[::-1]
         inst.block_splat_indices[i] = indices[order]
 
@@ -1632,16 +1595,6 @@ def _stop_redraw_timer():
         except Exception:
             pass
         _scene._redraw_timer = None
-
-
-def _try_stop_redraw_timer():
-    """Stop the redraw timer only if no instance needs sorting."""
-    if _scene._redraw_timer is None:
-        return
-    for inst in _scene.instances:
-        if inst._sort_active and inst.sorted_up_to < inst.block_count:
-            return
-    _stop_redraw_timer()
 
 
 def _redraw_tick():

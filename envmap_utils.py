@@ -34,23 +34,6 @@ _FACE_PARAMS = {
 _FACE_NAMES = ['px', 'nx', 'py', 'ny', 'pz', 'nz']
 
 
-def _equirect_direction(lon, lat):
-    """Convert longitude/latitude grids to world-space direction vectors (Z-up).
-
-    Args:
-        lon: (H, W) float32 array, longitude in [-pi, pi], azimuth around Z
-        lat: (H, W) float32 array, latitude in [-pi/2, pi/2], elevation from XY plane
-
-    Returns:
-        (H, W, 3) float32 array of unit direction vectors
-    """
-    cos_lat = np.cos(lat)
-    dx = cos_lat * np.sin(lon)
-    dy = cos_lat * np.cos(lon)
-    dz = np.sin(lat)
-    return np.stack([dx, dy, dz], axis=-1)
-
-
 # ---------------------------------------------------------------------------
 # Cubemap sampling helpers
 # ---------------------------------------------------------------------------
@@ -186,77 +169,69 @@ def _sample_dirs_from_center(local_samples, centers):
     return all_samples
 
 
-def generate_specular_mip_chain(faces, probe_w, levels=6, samples_per_pixel=256):
-    """Generate a roughness mip chain via GGX specular convolution.
-
-    Each level convolves the original cubemap with the GGX distribution at
-    increasing roughness in *direction space*, correctly handling spherical
-    geometry and cubemap face boundaries.
+def convolve_specular_level(level, levels, faces, probe_w, samples_per_pixel=256):
+    """Convolve a single mip level for the envmap specular mip chain.
 
     Args:
+        level: mip level index (0 = sharpest)
+        levels: total number of mip levels
         faces: dict of {name: (res, res, 4) float32}
         probe_w: width of level-0 equirectangular output (pixels)
-        levels: number of mip levels
         samples_per_pixel: GGX importance samples per output pixel
 
     Returns:
-        list of (H_i, W_i, 4) equirectangular images, one per mip level.
+        (H_i, W_i, 4) float32 equirectangular image for this level.
     """
-    chain = []
+    roughness = level / max(levels - 1, 1)
+    eq_w = max(probe_w >> level, 1)
+    eq_h = eq_w // 2
 
-    for level in range(levels):
-        roughness = level / max(levels - 1, 1)
-        eq_w = max(probe_w >> level, 1)
-        eq_h = eq_w // 2
+    print(f"[Envmap] Convolving level {level}  roughness={roughness:.3f}  "
+          f"{eq_w}×{eq_h}  samples={samples_per_pixel}")
 
-        print(f"[Envmap] Convolving level {level}  roughness={roughness:.3f}  "
-              f"{eq_w}×{eq_h}  samples={samples_per_pixel}")
+    # Equirectangular direction grid
+    lon = np.linspace(-np.pi, np.pi, eq_w, dtype=np.float32)
+    lat = np.linspace(np.pi / 2, -np.pi / 2, eq_h, dtype=np.float32)
+    lon2d, lat2d = np.meshgrid(lon, lat)
+    cos_lat = np.cos(lat2d)
+    dirs = np.stack([
+        cos_lat * np.sin(lon2d),  # X
+        cos_lat * np.cos(lon2d),  # Y
+        np.sin(lat2d),             # Z (pole)
+    ], axis=-1)  # (eq_h, eq_w, 3)
 
-        # Equirectangular direction grid
-        lon = np.linspace(-np.pi, np.pi, eq_w, dtype=np.float32)
-        lat = np.linspace(np.pi / 2, -np.pi / 2, eq_h, dtype=np.float32)
-        lon2d, lat2d = np.meshgrid(lon, lat)
-        cos_lat = np.cos(lat2d)
-        dirs = np.stack([
-            cos_lat * np.sin(lon2d),  # X
-            cos_lat * np.cos(lon2d),  # Y
-            np.sin(lat2d),             # Z (pole)
-        ], axis=-1)  # (eq_h, eq_w, 3)
+    if level == 0:
+        # Level 0 = sharp: single cubemap lookup per pixel
+        flat = dirs.reshape(-1, 3)
+        colors = _sample_cubemap(faces, flat)
+        eq = colors.reshape(eq_h, eq_w, 4)
+    else:
+        # GGX convolution
+        flat = dirs.reshape(-1, 3)
+        N = flat.shape[0]
 
-        if level == 0:
-            # Level 0 = sharp: single cubemap lookup per pixel
-            flat = dirs.reshape(-1, 3)
-            colors = _sample_cubemap(faces, flat)
-            eq = colors.reshape(eq_h, eq_w, 4)
-        else:
-            # GGX convolution
-            flat = dirs.reshape(-1, 3)
-            N = flat.shape[0]
+        # Pre-generate GGX sample pattern for this roughness
+        local_samples = _ggx_local_samples(roughness, samples_per_pixel, seed=level)
 
-            # Pre-generate GGX sample pattern for this roughness
-            local_samples = _ggx_local_samples(roughness, samples_per_pixel, seed=level)
+        # Process in batches to keep memory manageable
+        batch = 4096
+        eq = np.zeros((eq_h * eq_w, 4), dtype=np.float32)
 
-            # Process in batches to keep memory manageable
-            batch = 4096
-            eq = np.zeros((eq_h * eq_w, 4), dtype=np.float32)
+        for start in range(0, N, batch):
+            end = min(start + batch, N)
+            batch_centers = flat[start:end]
+            world = _sample_dirs_from_center(local_samples, batch_centers)
+            # (B, S, 3) → (B*S, 3)
+            B = end - start
+            world_flat = world.reshape(B * samples_per_pixel, 3)
+            colors = _sample_cubemap(faces, world_flat)
+            colors = colors.reshape(B, samples_per_pixel, 4)
+            eq[start:end] = colors.mean(axis=1)
 
-            for start in range(0, N, batch):
-                end = min(start + batch, N)
-                batch_centers = flat[start:end]
-                world = _sample_dirs_from_center(local_samples, batch_centers)
-                # (B, S, 3) → (B*S, 3)
-                B = end - start
-                world_flat = world.reshape(B * samples_per_pixel, 3)
-                colors = _sample_cubemap(faces, world_flat)
-                colors = colors.reshape(B, samples_per_pixel, 4)
-                eq[start:end] = colors.mean(axis=1)
+        eq = eq.reshape(eq_h, eq_w, 4)
 
-            eq = eq.reshape(eq_h, eq_w, 4)
-
-        chain.append(eq)
-        print(f"[Envmap] Level {level} done")
-
-    return chain
+    print(f"[Envmap] Level {level} done")
+    return eq
 
 
 
@@ -296,16 +271,3 @@ def pack_mip_atlas(mip_chain):
     return atlas, (common_w, total_h)
 
 
-def estimate_atlas_resolution(probe_w, levels=6):
-    """Compute the natural atlas dimensions for a vertical stack of mips.
-
-    Returns (width, height) tuple.
-    """
-    total_h = 0
-    w = probe_w
-    h = probe_w // 2
-    for _ in range(levels):
-        total_h += h
-        w = max(w // 2, 1)
-        h = max(h // 2, 1)
-    return probe_w, total_h

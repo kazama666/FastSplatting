@@ -66,26 +66,7 @@ class SPLATTING_PT_panel(types.Panel):
 
         layout.separator()
 
-        # Brightness (per-instance, applies in render only)
-        brightness_header, brightness_body = layout.panel_prop(splatting_props, "ui_brightness_expanded")
-        brightness_header.label(text="Brightness", icon='LIGHT_SUN')
-        if brightness_body:
-            instances = scene.splatting_instances
-            idx = splatting_props.active_instance_index
-            if 0 <= idx < len(instances):
-                item = instances[idx]
-                name = item.mesh_name
-                obj = bpy.data.objects.get(name)
-                if obj and obj.type == 'MESH':
-                    brightness_body.label(text=obj.name, icon='OBJECT_DATA')
-                else:
-                    brightness_body.label(text=name or "(missing)", icon='ERROR')
-                brightness_body.prop(item, "brightness_gain", text="Gain", slider=True)
-                brightness_body.prop(item, "brightness_gain_start", text="Start", slider=True)
-            else:
-                brightness_body.label(text="Select a mesh from Splat Meshes list", icon='INFO')
-
-        layout.split()
+        
 
         # --- Bake (collapsible) ---
         bake_header, bake_body = layout.panel_prop(splatting_props, "ui_bake_expanded")
@@ -141,11 +122,10 @@ class SPLATTING_PT_panel(types.Panel):
             if has_baked_data and current_obj is not None:
                 row.operator("splatting.remove_baked_lighting", text="", icon='X')
 
-
         layout.separator()
         if not splatting_props.is_rendering:
             settings_header, settings_body = layout.panel_prop(splatting_props, "ui_settings_expanded")
-            settings_header.label(text="Settings", icon='SETTINGS')
+            settings_header.label(text="Settings Before Render", icon='SETTINGS')
             if settings_body:
                 settings_body.prop(splatting_props, "show_block_grid", text="Display Grid")
                 if splatting_props.show_block_grid:
@@ -168,10 +148,30 @@ class SPLATTING_PT_panel(types.Panel):
         else:
             layout.operator("splatting.stop_render", text="Stop Render", icon='CANCEL')
 
-        layout.separator()
+        # Brightness (per-instance, applies in render only)
+        brightness_header, brightness_body = layout.panel_prop(splatting_props, "ui_brightness_expanded")
+        brightness_header.label(text="HDR Brightness", icon='LIGHT_SUN')
+        if brightness_body:
+            instances = scene.splatting_instances
+            idx = splatting_props.active_instance_index
+            if 0 <= idx < len(instances):
+                item = instances[idx]
+                name = item.mesh_name
+                obj = bpy.data.objects.get(name)
+                if obj and obj.type == 'MESH':
+                    brightness_body.label(text=obj.name, icon='OBJECT_DATA')
+                else:
+                    brightness_body.label(text=name or "(missing)", icon='ERROR')
+                brightness_body.prop(item, "brightness_gain", text="Gain", slider=True)
+                brightness_body.prop(item, "brightness_gain_start", text="Start", slider=True)
+            else:
+                brightness_body.label(text="Select a mesh from Splat Meshes list", icon='INFO')
+
+        layout.split()
+
         # Color adjustments
         color_header, color_body = layout.panel_prop(splatting_props, "ui_color_expanded")
-        color_header.label(text="Render Adjust", icon='COLOR')
+        color_header.label(text="Color Adjust", icon='COLOR')
         if color_body:
             instances = scene.splatting_instances
             idx = splatting_props.active_instance_index

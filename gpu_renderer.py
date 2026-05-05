@@ -761,6 +761,8 @@ def _aabb_wireframe(lo, hi=None):
 _grid_draw_handle = None
 _round_point_shader = None
 _sh_sphere_shader = None
+_sh_sphere_vbo = None
+_sh_sphere_ibo = None
 
 
 def _get_sh_sphere_shader():
@@ -791,7 +793,6 @@ def _get_sh_sphere_shader():
         vec3 world_n = normalize(mat3(u_model) * normalize(pos));
         vec3 raw = eval_sh(world_n);
         v_color = vec4(clamp(raw/3.14, 0.0, 1.0), 1.0);
-        v_color = pow(v_color, 1.2);
         gl_Position = u_mvp * u_model * vec4(pos, 1.0);
     }
     """)
@@ -1006,51 +1007,57 @@ def _grid_draw():
     # Baked SH probe spheres (when light probes exist)
     # ------------------------------------------------------------------
     if _all_baked_probe_verts and view_matrix is not None:
-        segs_s, rings_s = 16, 8
-        s_verts = []
-        s_verts.append([0.0, 0.0, 1.0])
-        for i in range(1, rings_s):
-            theta = i * np.pi / rings_s
-            for j in range(segs_s):
-                phi = j * 2.0 * np.pi / segs_s
-                x = np.sin(theta) * np.cos(phi)
-                y = np.sin(theta) * np.sin(phi)
-                z = np.cos(theta)
-                s_verts.append([x, y, z])
-        s_verts.append([0.0, 0.0, -1.0])
-        unit_verts = np.array(s_verts, dtype=np.float32)
-
-        s_idx = []
-        for j in range(segs_s):
-            a, b = 1 + j, 1 + (j + 1) % segs_s
-            s_idx.extend([0, b, a])
-        for i in range(rings_s - 2):
-            for j in range(segs_s):
-                a = 1 + i * segs_s + j
-                b = 1 + i * segs_s + (j + 1) % segs_s
-                c = 1 + (i + 1) * segs_s + j
-                d = 1 + (i + 1) * segs_s + (j + 1) % segs_s
-                s_idx.extend([a, b, c])
-                s_idx.extend([b, d, c])
-        last_pole = 1 + (rings_s - 1) * segs_s
-        for j in range(segs_s):
-            a = 1 + (rings_s - 2) * segs_s + j
-            b = 1 + (rings_s - 2) * segs_s + (j + 1) % segs_s
-            s_idx.extend([a, b, last_pole])
-        sphere_indices = np.array(s_idx, dtype=np.int32)
-        sphere_ibo = GPUIndexBuf(type='TRIS', seq=sphere_indices)
-
         sphere_scale = 0.075
+
+        # Build sphere geometry once, cache for reuse
+        global _sh_sphere_vbo, _sh_sphere_ibo
+        if _sh_sphere_vbo is None:
+            segs_s, rings_s = 16, 8
+            s_verts = []
+            s_verts.append([0.0, 0.0, 1.0])
+            for i in range(1, rings_s):
+                theta = i * np.pi / rings_s
+                for j in range(segs_s):
+                    phi = j * 2.0 * np.pi / segs_s
+                    x = np.sin(theta) * np.cos(phi)
+                    y = np.sin(theta) * np.sin(phi)
+                    z = np.cos(theta)
+                    s_verts.append([x, y, z])
+            s_verts.append([0.0, 0.0, -1.0])
+            unit_verts = np.array(s_verts, dtype=np.float32)
+
+            s_idx = []
+            for j in range(segs_s):
+                a, b = 1 + j, 1 + (j + 1) % segs_s
+                s_idx.extend([0, b, a])
+            for i in range(rings_s - 2):
+                for j in range(segs_s):
+                    a = 1 + i * segs_s + j
+                    b = 1 + i * segs_s + (j + 1) % segs_s
+                    c = 1 + (i + 1) * segs_s + j
+                    d = 1 + (i + 1) * segs_s + (j + 1) % segs_s
+                    s_idx.extend([a, b, c])
+                    s_idx.extend([b, d, c])
+            last_pole = 1 + (rings_s - 1) * segs_s
+            for j in range(segs_s):
+                a = 1 + (rings_s - 2) * segs_s + j
+                b = 1 + (rings_s - 2) * segs_s + (j + 1) % segs_s
+                s_idx.extend([a, b, last_pole])
+            sphere_indices = np.array(s_idx, dtype=np.int32)
+            _sh_sphere_ibo = GPUIndexBuf(type='TRIS', seq=sphere_indices)
+
+            fmt_pos = GPUVertFormat()
+            fmt_pos.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            _sh_sphere_vbo = GPUVertBuf(fmt_pos, len(unit_verts))
+            _sh_sphere_vbo.attr_fill(id="pos", data=unit_verts)
+
         sphere_shader = _get_sh_sphere_shader()
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('LESS')
         gpu.state.depth_mask_set(True)
         gpu.state.face_culling_set('FRONT')
 
-        fmt_pos = GPUVertFormat()
-        fmt_pos.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
-        pos_vbo = GPUVertBuf(fmt_pos, len(unit_verts))
-        pos_vbo.attr_fill(id="pos", data=unit_verts)
+        batch = GPUBatch(type='TRIS', buf=_sh_sphere_vbo, elem=_sh_sphere_ibo)
 
         for item in scene.splatting_instances:
             if not item.enabled:
@@ -1073,7 +1080,6 @@ def _grid_draw():
                 sh_g = np.array(pt.sh_g[:], dtype=np.float32)
                 sh_b = np.array(pt.sh_b[:], dtype=np.float32)
 
-                batch = GPUBatch(type='TRIS', buf=pos_vbo, elem=sphere_ibo)
                 sphere_shader.bind()
                 sphere_shader.uniform_float("u_mvp", mvp)
                 sphere_shader.uniform_float("u_model", model.T.ravel().tolist())

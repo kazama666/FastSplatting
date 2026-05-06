@@ -590,18 +590,18 @@ class SplattingRenderer:
         view_matrix = Matrix.Identity(4)
         camera = None
         region3d = None
-
         is_ortho = False
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                region3d = area.spaces.active.region_3d
+
+        area = context.area
+        if area and area.type == 'VIEW_3D':
+            region3d = area.spaces.active.region_3d
+            if region3d:
                 is_camera_view = region3d.view_perspective == 'CAMERA'
                 camera = context.scene.camera if is_camera_view else None
                 if is_camera_view:
                     is_ortho = camera and camera.data.type == 'ORTHO'
                 else:
                     is_ortho = region3d.view_perspective == 'ORTHO'
-                break
         viewport = state.viewport_get()
         vp_w, vp_h = viewport[2], viewport[3]
         if vp_w <= 0 or vp_h <= 0:
@@ -996,12 +996,12 @@ def _grid_draw():
     # ------------------------------------------------------------------
     mvp = Matrix.Identity(4)
     view_matrix = None
-    for area in context.screen.areas:
-        if area.type == 'VIEW_3D':
-            r3d = area.spaces.active.region_3d
+    area = context.area
+    if area and area.type == 'VIEW_3D':
+        r3d = area.spaces.active.region_3d
+        if r3d:
             mvp = r3d.window_matrix @ r3d.view_matrix
             view_matrix = r3d.view_matrix
-            break
 
     # ------------------------------------------------------------------
     # Baked SH probe spheres (when light probes exist)

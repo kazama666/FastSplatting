@@ -343,7 +343,6 @@ class SplattingScene:
         self.is_rendering = False
         self._draw_handle = None
         self._redraw_timer = None
-        self._preferred_area = None  # the 3D view area that was active at render start
 
         # Aggregated stats (set by renderer each frame)
         self.displayed_block_count = 0
@@ -355,7 +354,6 @@ class SplattingScene:
             inst.clear()
         self.instances.clear()
         self.is_rendering = False
-        self._preferred_area = None
         self.displayed_block_count = 0
         self.displayed_splat_count = 0
 
@@ -559,7 +557,7 @@ def try_update_probe_preview(context):
 # ---------------------------------------------------------------------------
 # Irradiance probe interpolation (PRE_VIEW draw handler)
 # ---------------------------------------------------------------------------
-_irradiance_objects = []        # object names with "irradiance_from_splats" modifier
+_irradiance_objects = []        # object names with "Lighting_From_Splats" modifier
 _irradiance_objects_dirty = True  # re-scan needed
 _irradiance_update_idx = 0      # round-robin counter
 _irradiance_pre_handle = None   # PRE_VIEW draw handler handle
@@ -628,7 +626,7 @@ def _refresh_probe_cache():
 
 
 def collect_irradiance_objects():
-    """Scan scene for meshes with a geometry node named 'irradiance_from_splats'.
+    """Scan scene for meshes with a geometry node named 'Lighting_From_Splats'.
 
     Result is cached — only re-scans when _irradiance_objects_dirty is set.
     """
@@ -640,7 +638,7 @@ def collect_irradiance_objects():
         if obj.type != 'MESH':
             continue
         for mod in obj.modifiers:
-            if mod.type == 'NODES' and mod.node_group and "irradiance_from_splats" in mod.node_group.name:
+            if mod.type == 'NODES' and mod.node_group and "Lighting_From_Splats" in mod.node_group.name:
                 _irradiance_objects.append(obj.name)
                 break
     _irradiance_objects_dirty = False
@@ -681,7 +679,7 @@ def _irradiance_pre_draw():
     # Find the modifier (still present?)
     target_mod = None
     for mod in obj.modifiers:
-        if mod.type == 'NODES' and mod.node_group and "irradiance_from_splats" in mod.node_group.name:
+        if mod.type == 'NODES' and mod.node_group and "Lighting_From_Splats" in mod.node_group.name:
             target_mod = mod
             break
     if not target_mod:
@@ -1162,38 +1160,22 @@ def build_spatial_index(positions, block_size=1.0, origin_offset=None, use_paral
 
 
 # ---------------------------------------------------------------------------
-# Draw handler — render splats in exactly one 3D view
+# Draw handler — render splats in the current 3D view
 # ---------------------------------------------------------------------------
-# We store _preferred_area at render start (the 3D view where the user clicked
-# "Start Render") and only draw when that area's handler fires.  If the
-# preferred area gets freed (new file load) we adopt the first 3D view seen.
+# Uses is_rendering to decide, not _preferred_area, since bpy.context.area
+# is unreliable in multi-window setups (always points to the active window,
+# not the viewport being drawn).
 def _draw_handler():
     try:
+        if not _scene.is_rendering:
+            return
         context = bpy.context
         area = context.area
         if not (area and area.type == 'VIEW_3D'):
             return
-
-        pref = _scene._preferred_area
-        if pref is not None:
-            try:
-                _ = pref.type
-            except ReferenceError:
-                _scene._preferred_area = None
-                pref = None
-
-        if pref is not None:
-            if area == pref:
-                from .gpu_renderer import draw_splatting
-                draw_splatting(context)
-                area.tag_redraw()
-        else:
-            # No preferred area (freed on new file load) — adopt the first
-            # 3D view encountered so splats stay visible.
-            _scene._preferred_area = area
-            from .gpu_renderer import draw_splatting
-            draw_splatting(context)
-            area.tag_redraw()
+        from .gpu_renderer import draw_splatting
+        draw_splatting(context)
+        area.tag_redraw()
     except ReferenceError:
         _emergency_stop()
 
@@ -1357,8 +1339,7 @@ def start_render(context):
         _scene.clear()
         return
 
-    # Register draw handler, remembering which 3D view area was active
-    _scene._preferred_area = context.area
+    # Register draw handler
     _scene._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
         _draw_handler, (), 'WINDOW', 'POST_VIEW'
     )
@@ -1571,15 +1552,6 @@ def sort_next_batch(inst, context):
         inst._sort_active = False
 
 
-def _find_first_3dview():
-    """Return the first VIEW_3D area across all windows, or None."""
-    for wm in bpy.data.window_managers:
-        for win in wm.windows:
-            for a in win.screen.areas:
-                if a.type == 'VIEW_3D':
-                    return a
-    return None
-
 
 def _start_redraw_timer():
     if _scene._redraw_timer is not None:
@@ -1602,28 +1574,6 @@ def _redraw_tick():
     if not _scene.is_rendering:
         _scene._redraw_timer = None
         return None
-
-    # If the preferred area is no longer among any visible 3D view
-    # (e.g. user maximized a different window), reassign to the first one.
-    if _scene._preferred_area is not None:
-        try:
-            _ = _scene._preferred_area.type
-        except ReferenceError:
-            _scene._preferred_area = None
-
-        if _scene._preferred_area is not None:
-            found = any(
-                a == _scene._preferred_area
-                for wm in bpy.data.window_managers
-                for win in wm.windows
-                for a in win.screen.areas
-                if a.type == 'VIEW_3D'
-            )
-            if not found:
-                _scene._preferred_area = _find_first_3dview()
-
-    if _scene._preferred_area is None:
-        _scene._preferred_area = _find_first_3dview()
 
     # Check if any instance still needs sorting
     for inst in _scene.instances:

@@ -35,6 +35,37 @@ def _unregister_capture_handler():
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_preview_socket(obj, value):
+    """Set the SplatsPreview Geometry Nodes modifier Socket_5 on *obj*."""
+    if obj and obj.type == 'MESH' and "SplatsPreview" in obj.modifiers:
+        try:
+            obj.modifiers["SplatsPreview"]["Socket_5"] = value
+            # Force depsgraph re-evaluation so the modifier updates immediately
+            obj.update_tag()
+        except Exception:
+            pass
+
+
+def _sync_all_preview_sockets(scene, value_for_enabled=True):
+    """Walk splatting_instances and set Socket_5 on each object's SplatsPreview modifier.
+
+    When *value_for_enabled* is True, enabled items get True and disabled get False.
+    When False, all items get the same value (e.g. False on render stop).
+    """
+    import bpy
+    for item in scene.splatting_instances:
+        obj = bpy.data.objects.get(item.mesh_name)
+        if value_for_enabled:
+            _set_preview_socket(obj, item.enabled)
+        else:
+            _set_preview_socket(obj, False)
+
+
+# ---------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------
 class SPLATTING_OT_start_render(types.Operator):
@@ -44,6 +75,9 @@ class SPLATTING_OT_start_render(types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
+        from .check_nodes import check_required_nodes
+        check_required_nodes()
+        _sync_all_preview_sockets(context.scene)
         from . import splatting_data
         splatting_data.start_render(context)
         return {'FINISHED'}
@@ -56,6 +90,7 @@ class SPLATTING_OT_stop_render(types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
+        _sync_all_preview_sockets(context.scene, value_for_enabled=False)
         from . import splatting_data
         splatting_data.stop_render(context)
         return {'FINISHED'}
@@ -77,6 +112,16 @@ class SPLATTING_OT_add_instance(types.Operator):
             if item.mesh_name == obj.name:
                 self.report({'INFO'}, f"'{obj.name}' is already in the list")
                 return {'CANCELLED'}
+
+        from .check_nodes import check_required_nodes
+        check_required_nodes()
+
+        # Add SplatsPreview Geometry Nodes modifier if not already present
+        if "SplatsPreview" not in obj.modifiers:
+            ng = bpy.data.node_groups.get("SplatsPreview")
+            if ng:
+                mod = obj.modifiers.new(name="SplatsPreview", type='NODES')
+                mod.node_group = ng
 
         item = context.scene.splatting_instances.add()
         item.mesh_name = obj.name
@@ -170,6 +215,12 @@ class SPLATTING_OT_toggle_instance(types.Operator):
         instances = context.scene.splatting_instances
         if 0 <= self.index < len(instances):
             instances[self.index].enabled = not instances[self.index].enabled
+            # Sync preview socket during rendering
+            from .splatting_data import get_state
+            if get_state().is_rendering:
+                item = instances[self.index]
+                obj = bpy.data.objects.get(item.mesh_name)
+                _set_preview_socket(obj, item.enabled)
         # Tag redraw so the toggle updates immediately
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
@@ -511,6 +562,11 @@ class SPLATTING_OT_bake_lightprobe(types.Operator):
     bl_description = "Bake SH2 light probes at block grid intersections for this splat instance"
 
     def execute(self, context):
+        from .check_nodes import check_required_nodes
+        if not check_required_nodes():
+            self.report({'ERROR'}, "Required nodes missing and could not be loaded")
+            return {'CANCELLED'}
+
         import numpy as np
 
         props = context.scene.splatting_properties
@@ -892,6 +948,11 @@ class SPLATTING_OT_bake_envmap(types.Operator):
     # invoke
     # ------------------------------------------------------------------
     def invoke(self, context, event):
+        from .check_nodes import check_required_nodes
+        if not check_required_nodes():
+            self.report({'ERROR'}, "Required nodes missing and could not be loaded")
+            return {'CANCELLED'}
+
         import numpy as np
         from mathutils import Matrix
 
@@ -1210,6 +1271,7 @@ class SPLATTING_OT_bake_envmap(types.Operator):
         img = bpy.data.images.new(name, width=atlas_w, height=atlas_h,
                                   float_buffer=True, alpha=True)
         img.pixels = atlas_data.ravel()
+        img.pack()
 
         # Store reference on the object
         self._obj.envmap_atlas = name
